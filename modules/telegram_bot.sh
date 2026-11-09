@@ -1,0 +1,2048 @@
+#!/bin/bash
+#============================================================
+# telegram_bot.sh - Bot Telegram para gerenciamento remoto
+#
+# Interface: menu de botões inline (o bot edita a própria
+# mensagem ao navegar, em vez de acumular mensagens no chat).
+# Ao dar /start, mostra um banner "SSH" acima do menu.
+#
+# Comandos ainda aceitos via texto (compatibilidade):
+#   /criar <user> <senha> <dias> <limite> — cria usuário SSH
+#   /teste <user> <senha> <minutos>       — cria usuário teste
+#   /remover <user>                       — remove usuário
+#   /listar   /onlines   /status   /backup
+#   /menu ou /start                       — reabre o menu
+#============================================================
+source "$INSTALL_DIR/modules/common.sh"
+
+BOT_CONF="$INSTALL_DIR/conf/telegram_bot.conf"
+BOT_SERVICE="/etc/systemd/system/vpnbot.service"
+BOT_SCRIPT="/usr/local/bin/vpnbot_worker.sh"
+BOT_OFFSET_FILE="/tmp/vpnbot_offset"
+PM_DB="/root/pm_users.db"
+BACKUP_DIR="/root/vpnmanager_backups"
+AUTO_BACKUP_CONF="$INSTALL_DIR/conf/autobackup.conf"
+
+# ── Helpers ──────────────────────────────────────────────────
+
+bot_is_configured(){
+    [[ -f "$BOT_CONF" ]] && source "$BOT_CONF" 2>/dev/null
+    [[ -n "$BOT_TOKEN" && -n "$BOT_CHAT_ID" ]]
+}
+
+bot_is_active(){
+    systemctl is-active --quiet vpnbot 2>/dev/null
+}
+
+_bot_load_conf(){
+    [[ -f "$BOT_CONF" ]] && source "$BOT_CONF" 2>/dev/null
+}
+
+# ── API Telegram via curl (usada fora do worker, ex: teste inicial) ──
+
+_tg_send(){
+    local token="$1" chat_id="$2" text="$3"
+    curl -s --max-time 12 -X POST "https://api.telegram.org/bot${token}/sendMessage" \
+        -d "chat_id=${chat_id}" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=${text}" \
+        > /dev/null 2>&1
+}
+
+_tg_send_file(){
+    local token="$1" chat_id="$2" filepath="$3" caption="$4"
+    curl -s --max-time 60 -X POST "https://api.telegram.org/bot${token}/sendDocument" \
+        -F "chat_id=${chat_id}" \
+        -F "document=@${filepath}" \
+        -F "caption=${caption}" \
+        > /dev/null 2>&1
+}
+
+# ── Geração do worker (script que roda como serviço) ──────────
+
+_write_bot_worker(){
+    local token="$1" chat_id="$2"
+
+    cat > "$BOT_SCRIPT" << HEADEREOF
+#!/bin/bash
+#============================================================
+# vpnbot_worker.sh — worker do bot Telegram (gerado automaticamente)
+#============================================================
+INSTALL_DIR="${INSTALL_DIR}"
+BOT_TOKEN="${token}"
+BOT_CHAT_ID="${chat_id}"
+PM_DB="/root/pm_users.db"
+BACKUP_DIR="${BACKUP_DIR}"
+OFFSET_FILE="${BOT_OFFSET_FILE}"
+SCREEN_MSG_FILE="/tmp/vpnbot_screen_msg"
+PENDING_FILE="/tmp/vpnbot_pending"
+PROMPT_MSG_FILE="/tmp/vpnbot_prompt_msg"
+TESTE_STATE_FILE="/tmp/vpnbot_teste_hours"
+RESTORE_TMP_FILE="/tmp/vpnbot_restore.tar.gz"
+AUTO_BACKUP_CONF="${INSTALL_DIR}/conf/autobackup.conf"
+AUTO_BACKUP_INTERVAL=21600
+HEADEREOF
+
+    # heredoc com delimitador entre aspas ('WORKEREOF') = conteúdo 100%
+    # literal, sem nenhuma expansão. Evita todo o inferno de escapar \$
+    # e crases duas vezes (uma para o heredoc, outra para o bash gerado).
+    cat >> "$BOT_SCRIPT" << 'WORKEREOF'
+
+source "$INSTALL_DIR/modules/common.sh"
+source "$INSTALL_DIR/modules/ssh_users.sh"
+source "$INSTALL_DIR/modules/xray.sh"
+source "$INSTALL_DIR/modules/v2ray.sh"
+source "$INSTALL_DIR/modules/system_info.sh"
+source "$INSTALL_DIR/modules/ram_clean.sh"
+
+API="https://api.telegram.org/bot${BOT_TOKEN}"
+
+# ── Utilitários ───────────────────────────────────────────────
+
+count_procs(){ ps -u "$1" -o pid= 2>/dev/null | wc -l | tr -d ' '; }
+
+gen_rand(){
+    # $1 = tamanho (padrão 8) — string aleatória minúscula+dígitos
+    # usa entrada de tamanho finito (uuid / sha256) p/ nunca travar no SIGPIPE
+    local n="${1:-8}" s
+    if (( n <= 32 )); then
+        s=$(cat /proc/sys/kernel/random/uuid 2>/dev/null)
+        [[ -z "$s" ]] && s=$(printf '%d%s' "$$" "$(date +%s%N)")
+    else
+        s=$(head -c 512 /dev/urandom | sha256sum)
+    fi
+    s=$(printf '%s' "$s" | sha256sum | tr -dc 'a-z0-9')
+    echo "${s:0:$n}"
+}
+
+AUTO_BACKUP_ENABLED="0"
+AUTO_BACKUP_LAST="0"
+
+_autobackup_load(){
+    AUTO_BACKUP_ENABLED="0"
+    AUTO_BACKUP_LAST="0"
+    [[ -f "$AUTO_BACKUP_CONF" ]] && source "$AUTO_BACKUP_CONF"
+}
+
+_autobackup_save(){
+    mkdir -p "$(dirname "$AUTO_BACKUP_CONF")"
+    cat > "$AUTO_BACKUP_CONF" << CONF
+AUTO_BACKUP_ENABLED="$AUTO_BACKUP_ENABLED"
+AUTO_BACKUP_LAST="$AUTO_BACKUP_LAST"
+CONF
+}
+
+tg_send(){
+    curl -s --max-time 12 -X POST "${API}/sendMessage" \
+        -d "chat_id=${BOT_CHAT_ID}" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$1"
+}
+
+tg_send_kb(){
+    curl -s --max-time 12 -X POST "${API}/sendMessage" \
+        -d "chat_id=${BOT_CHAT_ID}" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$1" \
+        --data-urlencode "reply_markup=$2"
+}
+
+tg_send_force(){
+    curl -s --max-time 12 -X POST "${API}/sendMessage" \
+        -d "chat_id=${BOT_CHAT_ID}" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$1" \
+        --data-urlencode 'reply_markup={"force_reply":true,"selective":true}'
+}
+
+tg_edit_kb(){
+    curl -s --max-time 12 -X POST "${API}/editMessageText" \
+        -d "chat_id=${BOT_CHAT_ID}" \
+        -d "message_id=$1" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=$2" \
+        --data-urlencode "reply_markup=$3"
+}
+
+tg_delete(){
+    curl -s --max-time 12 -X POST "${API}/deleteMessage" \
+        -d "chat_id=${BOT_CHAT_ID}" -d "message_id=$1" > /dev/null 2>&1
+}
+
+tg_answer_cb(){
+    curl -s --max-time 12 -X POST "${API}/answerCallbackQuery" \
+        -d "callback_query_id=$1" \
+        --data-urlencode "text=${2:-}" > /dev/null 2>&1
+}
+
+tg_send_file(){
+    curl -s --max-time 60 -X POST "${API}/sendDocument" \
+        -F "chat_id=${BOT_CHAT_ID}" \
+        -F "document=@$1" \
+        -F "caption=$2" > /dev/null 2>&1
+}
+
+# envia mensagem para um chat específico (ex: cliente da loja),
+# com ou sem teclado inline — não toca na tela do admin.
+tg_send_to(){
+    local chat="$1" text="$2" kb="$3"
+    if [[ -n "$kb" ]]; then
+        curl -s --max-time 12 -X POST "${API}/sendMessage" \
+            -d "chat_id=${chat}" \
+            -d "parse_mode=Markdown" \
+            --data-urlencode "text=${text}" \
+            --data-urlencode "reply_markup=${kb}" > /dev/null 2>&1
+    else
+        curl -s --max-time 12 -X POST "${API}/sendMessage" \
+            -d "chat_id=${chat}" \
+            -d "parse_mode=Markdown" \
+            --data-urlencode "text=${text}" > /dev/null 2>&1
+    fi
+}
+
+# envia sem esconder a resposta do Telegram (usado na divulgação p/ contar entregas)
+tg_send_to_resp(){
+    local chat="$1" text="$2"
+    curl -s --max-time 12 -X POST "${API}/sendMessage" \
+        -d "chat_id=${chat}" \
+        -d "parse_mode=Markdown" \
+        --data-urlencode "text=${text}"
+}
+
+# guarda quem já interagiu com o bot (p/ divulgações); sem duplicar
+_registra_cliente(){
+    local chat="$1" uname="$2"
+    uname=$(echo "$uname" | tr -d '@' | tr -d ' ' | head -c 40)
+    [[ -z "$chat" ]] && return
+    mkdir -p "$(dirname "$CLIENTES_FILE")"
+    if ! grep -q "^${chat}|" "$CLIENTES_FILE" 2>/dev/null; then
+        echo "${chat}|${uname}|$(date +%d/%m/%Y)" >> "$CLIENTES_FILE"
+    fi
+}
+
+# escapa caracteres especiais do Markdown (Telegram) em textos dinâmicos
+md_esc(){
+    echo "$1" | sed 's/\\/\\\\/g; s/\*/\\*/g; s/_/\\_/g; s/`/\\`/g; s/\[/\\[/g'
+}
+
+# ══ LOJA · MERCADO PAGO · PLANOS · VENDAS · RENOVAÇÃO ════════
+
+DELIVER_MSG_FILE="$INSTALL_DIR/conf/msg_entrega.txt"
+PLAN_UNIT_FILE="/tmp/vpnbot_plan_unit"
+PLAN_QTD_FILE="/tmp/vpnbot_plan_qtd"
+MP_CONF="$INSTALL_DIR/conf/mercadopago.conf"
+PLANS_CONF="$INSTALL_DIR/conf/planos.conf"
+COMPRAS_DB="/root/vpnbot_compras.db"
+PIX_PENDING_FILE="/tmp/vpnbot_pix_pending"
+PIX_POLL_PIDFILE="/tmp/vpnbot_pix_polling"
+TEST_LAST_FILE="$INSTALL_DIR/conf/test_ultimo.txt"
+TEST_STATS_FILE="$INSTALL_DIR/conf/test_stats.txt"
+TEST_BLOCK_FILE="$INSTALL_DIR/conf/test_bloqueio.txt"
+TEST_DAYS_FILE="$INSTALL_DIR/conf/test_dias.txt"
+TEST_GERADO_FILE="/tmp/vpnbot_ultimo_teste"
+CLIENTES_FILE="$INSTALL_DIR/conf/clientes.txt"
+
+# agenda a checagem de PIX em background; nunca bloqueia o loop do bot
+pix_poll_start(){
+    if [[ -f "$PIX_POLL_PIDFILE" ]]; then
+        local old; old=$(cat "$PIX_POLL_PIDFILE" 2>/dev/null)
+        if kill -0 "$old" 2>/dev/null; then return; fi
+        rm -f "$PIX_POLL_PIDFILE"
+    fi
+    ( check_pix_pending ) > /dev/null 2>&1 &
+    echo $! > "$PIX_POLL_PIDFILE"
+}
+
+_mp_load(){
+    MP_TOKEN=""
+    MP_STORE_ENABLED="0"
+    [[ -f "$MP_CONF" ]] && source "$MP_CONF"
+}
+
+_mp_save(){
+    mkdir -p "$(dirname "$MP_CONF")"
+    cat > "$MP_CONF" << CONF
+MP_TOKEN="$MP_TOKEN"
+MP_STORE_ENABLED="$MP_STORE_ENABLED"
+CONF
+    chmod 600 "$MP_CONF" 2>/dev/null
+}
+
+_deliver_msg_default(){
+    if [[ ! -f "$DELIVER_MSG_FILE" ]]; then
+        mkdir -p "$(dirname "$DELIVER_MSG_FILE")"
+        cat > "$DELIVER_MSG_FILE" <<'MSG'
+✅ *Pagamento aprovado!*
+Seu acesso está liberado 👇
+
+👤 Login: `{login}`
+🔑 Senha: `{senha}`
+📅 Validade: {validade}
+🛒 Plano: {plano}
+
+É só usar o login e senha em qualquer app
+de SSH (Termux, JuiceSSH,...).
+Obrigado pela compra! 🚀
+MSG
+    fi
+}
+
+# ── Planos (arquivo: nome|dias|valor) ────────────────────────
+
+planos_list(){
+    [[ -f "$PLANS_CONF" ]] || return 0
+    grep -v '^[[:space:]]*#' "$PLANS_CONF" | grep -v '^[[:space:]]*$'
+}
+
+plano_get(){
+    local i=0
+    while read -r line; do
+        i=$((i + 1))
+        [[ "$i" == "$1" ]] && { echo "$line"; return 0; }
+    done < <(planos_list)
+}
+
+plano_add(){
+    mkdir -p "$(dirname "$PLANS_CONF")"
+    echo "$1|$2|$3" >> "$PLANS_CONF"
+}
+
+plano_remove(){
+    local i=0 tmp="${PLANS_CONF}.new"
+    : > "$tmp"
+    while read -r line; do
+        i=$((i + 1))
+        [[ "$i" == "$1" ]] && continue
+        echo "$line" >> "$tmp"
+    done < <(planos_list)
+    mv "$tmp" "$PLANS_CONF"
+}
+
+# ── API Mercado Pago (PIX) ───────────────────────────────────
+
+mp_create_pix(){
+    local amount="$1" desc="$2" ext="$3"
+    local exp pem
+    exp=$(python3 -c "
+import datetime
+print((datetime.datetime.utcnow()+datetime.timedelta(minutes=30)).strftime('%Y-%m-%dT%H:%M:%S.000-00:00'))")
+    # e-mail do comprador 100% aleatório por pagamento (nunca é exibido)
+    pem="pix$(gen_rand 10)@gmail.com"
+    local body
+    body=$(python3 -c "
+import json
+exp='$exp'
+d={'transaction_amount': round(float('$amount'), 2), 'description': '$desc', 'payment_method_id': 'pix', 'external_reference': '$ext', 'payer': {'email': '$pem'}, 'date_of_expiration': exp}
+print(json.dumps(d))")
+    curl -s --max-time 15 -X POST "https://api.mercadopago.com/v1/payments" \
+        -H "Authorization: Bearer ${MP_TOKEN}" \
+        -H "Content-Type: application/json" \
+        -H "X-Idempotency-Key: ${ext}" \
+        -d "$body"
+}
+
+mp_payment_status(){
+    curl -s --max-time 15 "https://api.mercadopago.com/v1/payments/$1?fields=id,status,status_detail" \
+        -H "Authorization: Bearer ${MP_TOKEN}"
+}
+
+# ── Telas da loja para o cliente ─────────────────────────────
+
+txt_loja_cliente(){
+    local txt="🛒 *LOJA DE ACESSOS VPN*
+
+Escolha seu plano e pague via *PIX*.
+Quando o pagamento for *aprovado*, seu *login* e *senha* serão enviados aqui automaticamente. 👇
+
+"
+    local i=0 line nome dias valor
+    while read -r line; do
+        i=$((i + 1))
+        nome=$(echo "$line" | cut -d'|' -f1)
+        dias=$(echo "$line" | cut -d'|' -f2)
+        valor=$(echo "$line" | cut -d'|' -f3)
+        txt="${txt}${i}) *${nome}* — ${dias} dias — *R\$${valor}*
+"
+    done < <(planos_list)
+    if [[ "$i" -eq 0 ]]; then
+        echo "🛒 *LOJA DE ACESSOS VPN*
+
+Nenhum plano disponível no momento."
+    else
+        echo "${txt}
+💳 Após escolher, um *PIX copia e cola* será gerado."
+    fi
+}
+
+kb_loja_cliente(){
+    local mode="${1:-buy}"
+    local kb='{"inline_keyboard":['
+    local i=0 line nome valor
+    while read -r line; do
+        i=$((i + 1))
+        nome=$(echo "$line" | cut -d'|' -f1)
+        valor=$(echo "$line" | cut -d'|' -f3)
+        kb="${kb}[{\"text\":\"🛒 ${nome} — R\$${valor}\",\"callback_data\":\"${mode}_${i}\"}],"
+    done < <(planos_list)
+    if [[ "$mode" == "buy" ]]; then
+        kb="${kb}[{\"text\":\"🔄 Renovar meu acesso\",\"callback_data\":\"m_renew\"}],
+[{\"text\":\"🆓 Gerar Teste 2h (1x por dia)\",\"callback_data\":\"cli_teste\"}],"
+    fi
+    kb="${kb%,}]}"
+    echo "$kb"
+}
+
+cliente_abrir_loja(){
+    local chat="$1"
+    _mp_load
+    if [[ "$MP_STORE_ENABLED" != "1" || -z "$MP_TOKEN" ]]; then
+        tg_send_to "$chat" "🛒 *LOJA DE ACESSOS VPN*
+
+A loja está temporariamente indisponível.
+🆓 Mas você ainda pode testar a VPN:" "$KB_CLI_TESTE"
+        return
+    fi
+    if [[ -f "/tmp/vpnbot_cli_renew_${chat}" ]]; then
+        tg_send_to "$chat" "✏️ *Renovando acesso*
+
+`cat "/tmp/vpnbot_cli_renew_${chat}"`
+
+Escolha o plano de renovação:" "$(kb_loja_cliente ren)"
+    else
+        tg_send_to "$chat" "$(txt_loja_cliente)" "$(kb_loja_cliente buy)"
+    fi
+}
+
+# ── Compra / Renovação ───────────────────────────────────────
+
+do_make_pedido(){
+    local idx="$1" chat="$2" cbid="$3" modo="$4" rlogin="$5"
+    _mp_load
+
+    if [[ "$MP_STORE_ENABLED" != "1" ]]; then
+        tg_answer_cb "$cbid" "Loja indisponível."
+        tg_send_to "$chat" "🛒 Loja temporariamente indisponível. Tente mais tarde."
+        return
+    fi
+    if [[ -z "$MP_TOKEN" ]]; then
+        tg_answer_cb "$cbid" "Erro interno."
+        return
+    fi
+
+    local line; line=$(plano_get "$idx")
+    if [[ -z "$line" ]]; then
+        tg_answer_cb "$cbid" "Plano inválido."
+        return
+    fi
+    local nome dias valor
+    nome=$(echo "$line" | cut -d'|' -f1)
+    dias=$(echo "$line" | cut -d'|' -f2)
+    valor=$(echo "$line" | cut -d'|' -f3)
+
+    rm -f "/tmp/vpnbot_cli_renew_${chat}"
+
+    local ext="c${chat}_$(date +%s)"
+    local resp; resp=$(mp_create_pix "$valor" "Plano ${nome} (${dias}d)" "$ext")
+
+    local pid qr st
+    pid=$(echo "$resp" | python3 -c "import sys,json
+try:
+    print(json.load(sys.stdin).get('id',''))
+except Exception:
+    print('')" 2>/dev/null)
+
+    if [[ -z "$pid" ]]; then
+        local mp_msg
+        mp_msg=$(echo "$resp" | python3 -c "import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d.get('message', d.get('error','')))
+except Exception:
+    print('')" 2>/dev/null)
+        tg_answer_cb "$cbid" "Não foi possível gerar o PIX."
+        tg_send_to "$chat" "❌ Não consegui gerar seu pagamento agora. Tente novamente em alguns minutos."
+        tg_send "⚠️ *Falha ao gerar PIX (Mercado Pago)*
+Motivo: ${mp_msg:-$(echo "$resp" | head -c 300)}
+
+Dica: se for erro de *token*, gere um novo *Access Token* no painel do Mercado Pago e salve em *Loja & Vendas → Mercado Pago*." > /dev/null 2>&1
+        return
+    fi
+
+    qr=$(echo "$resp" | python3 -c "import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d.get('point_of_interaction',{}).get('transaction_data',{}).get('qr_code',''))
+except Exception:
+    print('')" 2>/dev/null)
+
+    echo "${pid}|${chat}|${nome}|${dias}|${valor}|$(date +%s)|${modo:-create}|${rlogin:-}" >> "$PIX_PENDING_FILE"
+
+    if [[ "$modo" == "renew" ]]; then
+        tg_send_to "$chat" "✅ *Renovação gerada!*
+
+🛒 Conta: \`${rlogin}\`
+📅 Plano: *${nome}* (+${dias} dias)
+💰 Valor: *R\$${valor}*
+🧾 Pedido: \`${pid}\`
+
+*PIX copia e cola* (30 min para pagar):
+
+\`\`\`
+${qr}
+\`\`\`
+
+Assim que o pagamento for *aprovado*, seu acesso será *renovado* automaticamente."
+    else
+        tg_send_to "$chat" "✅ *Pedido gerado!*
+
+🛒 Plano: *${nome}* (${dias} dias)
+💰 Valor: *R\$${valor}*
+🧾 Pedido: \`${pid}\`
+
+*PIX copia e cola* (30 min para pagar):
+
+\`\`\`
+${qr}
+\`\`\`
+
+Assim que o pagamento for *aprovado*, suas *credenciais de acesso* serão enviadas aqui."
+    fi
+
+    tg_answer_cb "$cbid" "Pagamento PIX gerado ✓"
+}
+
+registrar_compra(){
+    echo "$(date '+%d/%m/%Y %H:%M')|$1|$2|$3|$4|$5|$6" >> "$COMPRAS_DB"
+}
+
+entregar_login(){
+    local chat="$1" nome="$2" dias="$3" valor="$4"
+    local user="v$(gen_rand 6)" pass="$(gen_rand 10)"
+    local result; result=$(ssh_create_api "$user" "$pass" "$dias" "0" 2>&1)
+    if [[ "$result" != "CRIADOCOMSUCESSO" ]]; then
+        tg_send "⚠️ *Falha ao criar login vendido*
+Cliente: $chat
+Plano: $nome (${dias}d, R\$$valor)
+Erro: $result
+Crie o acesso manualmente e envie ao cliente." > /dev/null 2>&1
+        return 1
+    fi
+    local exp; exp=$(date "+%d/%m/%Y" -d "+$((dias + 1)) days")
+    local msg; msg=$(cat "$DELIVER_MSG_FILE" 2>/dev/null)
+    msg=$(echo "$msg" | sed "s|{login}|${user}|g; s|{senha}|${pass}|g; s|{validade}|${exp}|g; s|{plano}|${nome}|g")
+    tg_send_to "$chat" "$msg"
+    tg_send_to "$chat" "💡 *Dica:* use \`/renovar\` no bot quando quiser *renovar* este acesso."
+    registrar_compra "$chat" "$nome" "$dias" "$valor" "aprovado" "$user"
+}
+
+renovar_login(){
+    local chat="$1" login="$2" dias="$3" valor="$4" nome="$5"
+    if ! getent passwd "$login" > /dev/null 2>&1; then
+        tg_send "⚠️ *Renovação:* login '$login' não existe mais na VPS.
+Cliente: $chat — o acesso será criado de novo." > /dev/null 2>&1
+        entregar_login "$chat" "$nome" "$dias" "$valor"
+        return
+    fi
+    local result; result=$(ssh_renew_api "$login" "$dias" 2>&1)
+    if [[ "$result" != "RENOVADOCOMSUCESSO" ]]; then
+        tg_send_to "$chat" "❌ Não consegui renovar seu login do sistema. Chame o suporte."
+        tg_send "⚠️ *Falha ao renovar login vendido*
+Cliente: $chat
+Login: $login
+Plano: $nome (${dias}d)
+Erro: $result" > /dev/null 2>&1
+        return
+    fi
+    local exp; exp=$(date "+%d/%m/%Y" -d "+$dias days")
+    tg_send_to "$chat" "✅ *Pagamento aprovado!*
+✨ Seu acesso foi *renovado* com sucesso!
+
+🛒 Plano: *${nome}* (+${dias} dias)
+👤 Login: \`${login}\`
+📅 Nova validade: ${exp}
+
+Obrigado por renovar! 🚀"
+    registrar_compra "$chat" "$nome" "$dias" "$valor" "renovado" "$login"
+}
+
+check_pix_pending(){
+    [[ -f "$PIX_PENDING_FILE" ]] || return
+    local tmp="${PIX_PENDING_FILE}.tmp"
+    : > "$tmp"
+    local now_ts; now_ts=$(date +%s)
+    while IFS='|' read -r pid chat nome dias valor ts modo login; do
+        [[ -z "$pid" ]] && continue
+        local st; st=$(mp_payment_status "$pid")
+        local status; status=$(echo "$st" | python3 -c "import sys,json
+try:
+    print(json.load(sys.stdin).get('status',''))
+except Exception:
+    print('')" 2>/dev/null)
+        case "$status" in
+            approved)
+                if [[ "$modo" == "renew" && -n "$login" ]]; then
+                    renovar_login "$chat" "$login" "$dias" "$valor" "$nome"
+                else
+                    entregar_login "$chat" "$nome" "$dias" "$valor"
+                fi
+                ;;
+            rejected|cancelled|expired)
+                tg_send_to "$chat" "❌ Seu pagamento (*\`${pid}\`*) foi *${status}*. Se houve cobrança indevida, chame o suporte." > /dev/null 2>&1
+                ;;
+            *)
+                if (( now_ts - ts > 5400 )); then
+                    tg_send_to "$chat" "⏰ O PIX *\`${pid}\`* expirou (30 min). Faça um novo pedido se ainda quiser." > /dev/null 2>&1
+                else
+                    echo "${pid}|${chat}|${nome}|${dias}|${valor}|${ts}|${modo}|${login}" >> "$tmp"
+                fi
+                ;;
+        esac
+    done < "$PIX_PENDING_FILE"
+    mv "$tmp" "$PIX_PENDING_FILE"
+}
+
+# ── Telas do admin (configuração da loja) ────────────────────
+
+txt_loja_admin(){
+    _mp_load
+    local st_mp="❌ não configurado"
+    [[ -n "$MP_TOKEN" ]] && st_mp="✅ configurado"
+    local st_loja="🔴 OFF"
+    [[ "$MP_STORE_ENABLED" == "1" ]] && st_loja="🟢 ON"
+    local np; np=$(planos_list | grep -c . ); np=${np:-0}
+    echo "🛒 *Loja de vendas*
+
+💰 Mercado Pago : $st_mp
+🛍 Loja ativa   : $st_loja
+📋 Planos       : $np
+
+*Cliente*: ao dar /start, vê os planos e paga via *PIX*. Após o pagamento aprovado, o *login* e *senha* são enviados automaticamente — e ele pode *renovar* depois.
+
+*Admin*: aqui você configura o token do Mercado Pago, os planos (nome; dias; valor) e a mensagem de entrega."
+}
+
+txt_planos_admin(){
+    local t="📋 *PLANOS DE LOGIN*
+
+Para adicionar: toque em *➕ Adicionar plano* e responda
+se o acesso é em *dias ou meses*, a *quantidade* e o *valor*.
+
+"
+    local i=0 line nome dias valor
+    while read -r line; do
+        i=$((i + 1))
+        nome=$(echo "$line" | cut -d'|' -f1)
+        dias=$(echo "$line" | cut -d'|' -f2)
+        valor=$(echo "$line" | cut -d'|' -f3)
+        t="${t}${i}) ${nome} — ${dias} dias — R\$${valor}
+"
+    done < <(planos_list)
+    [[ "$i" -eq 0 ]] && t="${t}Nenhum plano cadastrado ainda.
+"
+    echo "$t"
+}
+
+kb_planos(){
+    local kb='{"inline_keyboard":['
+    local i=0 line nome
+    while read -r line; do
+        i=$((i + 1))
+        nome=$(echo "$line" | cut -d'|' -f1)
+        kb="${kb}[{\"text\":\"🗑 Remover ${nome}\",\"callback_data\":\"rp_${i}\"}],"
+    done < <(planos_list)
+    kb="${kb}[{\"text\":\"➕ Adicionar plano\",\"callback_data\":\"a_addplano\"}],"
+    kb="${kb}[{\"text\":\"⬅️ Voltar\",\"callback_data\":\"m_loja\"}]]}"
+    echo "$kb"
+}
+
+build_compras(){
+    if [[ ! -s "$COMPRAS_DB" ]]; then
+        echo "🛍 *COMPRAS REALIZADAS*
+
+Nenhuma compra ainda."
+        return
+    fi
+    local t="🛍 *COMPRAS REALIZADAS*
+
+"
+    local n=0 ts chat nome dias valor st login
+    while IFS='|' read -r ts chat nome dias valor st login; do
+        n=$((n + 1))
+        t="${t}${n}) ${ts}
+   Cliente: \`${chat}\` · ${nome} (${dias}d · R\$${valor})
+   ${st} · Login: \`${login}\`
+"
+    done < <(tail -n 20 "$COMPRAS_DB")
+    echo "$t"
+}
+
+# baixa um arquivo enviado pelo usuário (document) usando seu file_id.
+# $1 = file_id   $2 = caminho local de destino
+tg_download_file(){
+    local file_id="$1" dest="$2"
+    local info; info=$(curl -s --max-time 12 "${API}/getFile?file_id=${file_id}")
+    local file_path; file_path=$(echo "$info" | python3 -c "import sys,json
+try:
+    print(json.load(sys.stdin).get('result',{}).get('file_path',''))
+except Exception:
+    print('')" 2>/dev/null)
+    [[ -z "$file_path" ]] && return 1
+    curl -s --max-time 30 -o "$dest" "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}"
+}
+
+extract_msg_id(){
+    python3 -c "import sys,json
+try:
+    d=json.load(sys.stdin)
+    print(d.get('result',{}).get('message_id',''))
+except Exception:
+    print('')" 2>/dev/null
+}
+
+# Mostra uma "tela" do menu editando a mensagem anterior do bot,
+# em vez de mandar uma nova — mantém o chat limpo ao navegar.
+show_screen(){
+    local text="$1" kb="$2" mid=""
+    [[ -f "$SCREEN_MSG_FILE" ]] && mid=$(cat "$SCREEN_MSG_FILE")
+    if [[ -n "$mid" ]]; then
+        local resp; resp=$(tg_edit_kb "$mid" "$text" "$kb")
+        echo "$resp" | grep -q '"ok":true' && return
+    fi
+    local resp2; resp2=$(tg_send_kb "$text" "$kb")
+    local newid; newid=$(echo "$resp2" | extract_msg_id)
+    [[ -n "$newid" ]] && echo "$newid" > "$SCREEN_MSG_FILE"
+}
+
+# ── Teclados (inline keyboards) ──────────────────────────────
+
+KB_MAIN='{"inline_keyboard":[[{"text":"👤 Usuários","callback_data":"m_users"},{"text":"📡 Online","callback_data":"c_onlines"}],[{"text":"⚙️ Status","callback_data":"c_status"},{"text":"📦 Backup","callback_data":"m_backup"}],[{"text":"🖥 Servidor","callback_data":"m_server"},{"text":"❓ Ajuda","callback_data":"m_ajuda"}],[{"text":"🛒 Loja & Vendas","callback_data":"m_loja"},{"text":"🧪 Testes","callback_data":"m_testes"}],[{"text":"📣 Divulgação","callback_data":"m_divulgar"}]]}'
+
+KB_CLI_TESTE='{"inline_keyboard":[[{"text":"🆓 Gerar Teste 2h (1x por dia)","callback_data":"cli_teste"}]]}'
+
+KB_TESTES='{"inline_keyboard":[[{"text":"🏆 Quem mais pede testes","callback_data":"t_rank"}],[{"text":"🚨 Pede todo dia, nunca compra","callback_data":"t_sus"}],[{"text":"🚫 Bloquear / Liberar cliente","callback_data":"t_block"}],[{"text":"📋 Bloqueados agora","callback_data":"t_list"}],[{"text":"⬅️ Voltar","callback_data":"m_main"}]]}'
+
+KB_USERS='{"inline_keyboard":[[{"text":"➕ Criar usuário","callback_data":"w_criar"},{"text":"🧪 Criar teste","callback_data":"w_teste"}],[{"text":"📋 Listar","callback_data":"c_listar"},{"text":"🗑 Remover","callback_data":"w_remover"}],[{"text":"⬅️ Voltar","callback_data":"m_main"}]]}'
+
+KB_BACK='{"inline_keyboard":[[{"text":"⬅️ Voltar","callback_data":"m_main"}]]}'
+
+KB_LOJA='{"inline_keyboard":[[{"text":"💰 Mercado Pago","callback_data":"a_mp"}],[{"text":"📋 Planos de Login","callback_data":"m_planos"}],[{"text":"✉️ Mensagem de entrega","callback_data":"a_msg"}],[{"text":"🛍 Compras realizadas","callback_data":"a_compras"}],[{"text":"🛍 Loja ON/OFF","callback_data":"a_loja"}],[{"text":"⬅️ Voltar","callback_data":"m_main"}]]}'
+
+KB_MSGENTREGA='{"inline_keyboard":[[{"text":"🔄 Usar mensagem padrão","callback_data":"a_msg_reset"}],[{"text":"⬅️ Voltar","callback_data":"m_loja"}]]}'
+
+KB_TESTE_DURACAO='{"inline_keyboard":[[{"text":"1 hora","callback_data":"td_1"},{"text":"2 horas","callback_data":"td_2"},{"text":"4 horas","callback_data":"td_4"}],[{"text":"⬅️ Voltar","callback_data":"m_users"}]]}'
+
+KB_SERVER='{"inline_keyboard":[[{"text":"🔄 Reiniciar VPS","callback_data":"sv_reboot"},{"text":"🧹 Limpar iptables","callback_data":"sv_iptables"}],[{"text":"🔑 Trocar senha root","callback_data":"sv_rootpass"},{"text":"🔓 Portas abertas","callback_data":"sv_ports"}],[{"text":"🧹 Limpar RAM","callback_data":"sv_ramclean"}],[{"text":"⬅️ Voltar","callback_data":"m_main"}]]}'
+
+KB_CONFIRM_REBOOT='{"inline_keyboard":[[{"text":"✅ Sim, reiniciar","callback_data":"sv_reboot_yes"},{"text":"❌ Cancelar","callback_data":"m_server"}]]}'
+
+KB_CONFIRM_IPTABLES='{"inline_keyboard":[[{"text":"✅ Sim, limpar","callback_data":"sv_iptables_yes"},{"text":"❌ Cancelar","callback_data":"m_server"}]]}'
+
+KB_CONFIRM_ROOTPASS='{"inline_keyboard":[[{"text":"✅ Sim, trocar","callback_data":"sv_rootpass_yes"},{"text":"❌ Cancelar","callback_data":"m_server"}]]}'
+
+KB_SERVER_BACK='{"inline_keyboard":[[{"text":"⬅️ Voltar","callback_data":"m_server"}]]}'
+
+KB_CONFIRM_RESTORE='{"inline_keyboard":[[{"text":"✅ Sim, restaurar","callback_data":"rs_yes"},{"text":"❌ Cancelar","callback_data":"rs_no"}]]}'
+
+# monta o teclado de protocolo do teste dinamicamente — só mostra
+# Xray/V2Ray se estiverem instalados no servidor.
+kb_teste_protocolo(){
+    local row='[{"text":"🔒 SSH","callback_data":"tp_ssh"}'
+    xray_is_installed  && row="${row},{\"text\":\"⚡ Xray\",\"callback_data\":\"tp_xray\"}"
+    v2ray_is_installed && row="${row},{\"text\":\"🌀 V2Ray\",\"callback_data\":\"tp_v2ray\"}"
+    row="${row}]"
+    echo "{\"inline_keyboard\":[${row},[{\"text\":\"⬅️ Voltar\",\"callback_data\":\"m_users\"}]]}"
+}
+
+kb_backup(){
+    _autobackup_load
+    local label="🔁 Ativar auto backup (6h)"
+    [[ "$AUTO_BACKUP_ENABLED" == "1" ]] && label="⏸ Desativar auto backup"
+    echo "{\"inline_keyboard\":[[{\"text\":\"📦 Gerar backup agora\",\"callback_data\":\"c_backup\"}],[{\"text\":\"${label}\",\"callback_data\":\"c_autobackup_toggle\"}],[{\"text\":\"⬅️ Voltar\",\"callback_data\":\"m_main\"}]]}"
+}
+
+# ── Textos das telas ──────────────────────────────────────────
+
+BANNER="\`\`\`
+┌───────────────────┐
+│   🔐   S S H       │
+└───────────────────┘
+\`\`\`"
+
+txt_main(){
+    echo "${BANNER}
+*VPNManager Bot*
+Escolha uma opção abaixo 👇"
+}
+
+txt_users(){
+    echo "👤 *Usuários SSH*
+Escolha uma ação:"
+}
+
+txt_teste_duracao(){
+    echo "🧪 *Criar teste*
+Escolha a duração:"
+}
+
+txt_teste_protocolo(){
+    echo "🧪 *Criar teste*
+Escolha o protocolo:"
+}
+
+txt_server(){
+    echo "🖥 *Gerenciar Servidor*
+Escolha uma ação:"
+}
+
+txt_backup(){
+    _autobackup_load
+    local status="🔴 Desativado"
+    [[ "$AUTO_BACKUP_ENABLED" == "1" ]] && status="🟢 Ativado (a cada 6h)"
+    echo "📦 *Backup*
+
+Auto backup: $status"
+}
+
+txt_ajuda(){
+    echo "❓ *Ajuda*
+
+Use os botões para navegar:
+👤 Usuários · 📡 Online · ⚙️ Status
+📦 Backup · 🖥 Servidor
+
+*Criar teste* agora pergunta a duração
+(1h/2h/4h) e o protocolo (SSH/Xray/V2Ray),
+e gera usuário e senha automaticamente.
+
+*Gerenciar servidor*: reiniciar VPS, limpar
+iptables, trocar senha do root e ver portas
+abertas.
+
+*Restaurar backup*: envie o arquivo
+\`vpnbackup_....tar.gz\` aqui no chat que eu
+pergunto se quer restaurar.
+
+Comandos de texto ainda funcionam:
+
+/criar \`<user> <senha> <dias> <limite>\`
+/teste \`<user> <senha> <minutos>\`
+/remover \`<user>\`
+/listar  /onlines  /status  /backup
+/menu — reabre este menu"
+}
+
+# ── Construção de textos dinâmicos ───────────────────────────
+
+build_listar(){
+    local lista="" total=0
+    while IFS=: read -r u _ uid _ _ _ shell; do
+        [[ "$uid" -lt 1000 || "$shell" != "/bin/false" ]] && continue
+        (( total++ ))
+        local exp; exp=$(chage -l "$u" 2>/dev/null | grep "Account expires" | cut -d: -f2 | xargs)
+        [[ "$exp" == "never" || -z "$exp" ]] && exp="nunca"
+        local limit; limit=$(grep "^$u " "$PM_DB" 2>/dev/null | awk '{print $2}')
+        [[ -z "$limit" || "$limit" == "0" ]] && limit="∞"
+        lista="${lista}
+👤 \`$u\` — expira: $exp — limite: $limit"
+    done < <(sort -t: -k1,1 /etc/passwd)
+    if [[ "$total" -eq 0 ]]; then
+        echo "📋 Nenhum usuário cadastrado."
+    else
+        echo "📋 *Usuários cadastrados ($total)*${lista}"
+    fi
+}
+
+build_onlines(){
+    local lista="" total=0
+    while IFS=: read -r u _ uid _ _ _ shell; do
+        [[ "$uid" -lt 1000 || "$shell" != "/bin/false" ]] && continue
+        local procs; procs=$(count_procs "$u")
+        [[ "$procs" -eq 0 ]] && continue
+        (( total++ ))
+        lista="${lista}
+🟢 \`$u\` — $procs conexão(ões)"
+    done < <(sort -t: -k1,1 /etc/passwd)
+    if [[ "$total" -eq 0 ]]; then
+        echo "📡 Nenhum usuário online agora."
+    else
+        echo "📡 *Online agora ($total)*${lista}"
+    fi
+}
+
+build_status(){
+    local msg="⚙️ *Status dos Serviços*"
+    for svc in ssh xray v2ray slowdns badvpn; do
+        if systemctl is-active --quiet "$svc" 2>/dev/null; then
+            msg="${msg}
+✅ $svc — ATIVO"
+        elif systemctl list-units --all 2>/dev/null | grep -q "$svc"; then
+            msg="${msg}
+🔴 $svc — PARADO"
+        fi
+    done
+    local upt; upt=$(uptime -p 2>/dev/null | sed 's/up //')
+    local mem; mem=$(free -m 2>/dev/null | awk '/^Mem/{printf "%dMB/%dMB", $3, $2}')
+    msg="${msg}
+
+🖥 Uptime : $upt
+💾 Memória: $mem"
+    echo "$msg"
+}
+
+# ── Ações (criar / teste / remover / backup) ─────────────────
+
+do_criar(){
+    local user="$1" pass="$2" dias="$3" limite="$4"
+    if [[ -z "$user" || -z "$pass" || -z "$dias" ]]; then
+        echo "❌ Formato inválido. Use: usuario senha dias limite"
+        return
+    fi
+    if [[ ! "$dias" =~ ^[0-9]+$ ]]; then
+        echo "❌ Dias deve ser número."
+        return
+    fi
+    limite="${limite:-0}"
+    local result; result=$(ssh_create_api "$user" "$pass" "$dias" "$limite" 2>&1)
+    if [[ "$result" == "CRIADOCOMSUCESSO" ]]; then
+        local exp; exp=$(date "+%d/%m/%Y" -d "+$((dias+1)) days")
+        echo "✅ *Usuário criado!*
+
+👤 Usuário : \`$user\`
+🔑 Senha   : \`$pass\`
+📅 Expira  : $exp
+🔗 Limite  : $([[ "$limite" -eq 0 ]] && echo 'ilimitado' || echo "$limite conexões")"
+    else
+        echo "❌ Erro ao criar usuário: $result"
+    fi
+}
+
+do_teste_manual(){
+    local user="$1" pass="$2" minutos="$3"
+    if [[ -z "$user" || -z "$pass" || -z "$minutos" ]]; then
+        echo "❌ Formato inválido. Use: usuario senha minutos"
+        return
+    fi
+    if [[ ! "$minutos" =~ ^[0-9]+$ ]]; then
+        echo "❌ Minutos deve ser número."
+        return
+    fi
+    local result; result=$(ssh_create_api "$user" "$pass" "1" "1" 2>&1)
+    if [[ "$result" == "CRIADOCOMSUCESSO" ]]; then
+        echo "✅ *Teste criado!*
+
+👤 Usuário : \`$user\`
+🔑 Senha   : \`$pass\`
+⏱ Expira  : ${minutos} minuto(s)"
+        nohup bash -c "sleep $((minutos * 60)) && ssh_remove_api '$user'" >/dev/null 2>&1 &
+    else
+        echo "❌ Erro ao criar teste: $result"
+    fi
+}
+
+# cria um teste com usuário/senha gerados automaticamente.
+# $1 = horas (1|2|4)   $2 = protocolo (ssh|xray|v2ray)
+do_teste_auto(){
+    local hours="$1" protocolo="$2"
+    local user="t$(gen_rand 5)"
+    local pass="$(gen_rand 10)"
+
+    local result; result=$(ssh_create_api "$user" "$pass" "1" "1" 2>&1)
+    if [[ "$result" != "CRIADOCOMSUCESSO" ]]; then
+        echo "❌ Erro ao criar teste: $result"
+        return
+    fi
+
+    local seconds=$(( hours * 3600 ))
+    nohup bash -c "sleep $seconds && ssh_remove_api '$user'" >/dev/null 2>&1 &
+
+    local proto_label="SSH"
+    [[ "$protocolo" == "xray"  ]] && proto_label="Xray (VLESS)"
+    [[ "$protocolo" == "v2ray" ]] && proto_label="V2Ray (VMess)"
+
+    local out="✅ *Teste criado!*
+
+👤 Usuário  : \`$user\`
+🔑 Senha    : \`$pass\`
+⏱ Expira   : ${hours}h
+🔌 Protocolo: $proto_label"
+
+    if [[ "$protocolo" == "xray" && -f "$CRED_FILE" ]]; then
+        local uuid; uuid=$(grep -oP '^vless://\K[^@]+' "$CRED_FILE" | head -1)
+        [[ -n "$uuid" ]] && out="${out}
+
+🆔 UUID Xray:
+\`$uuid\`"
+    elif [[ "$protocolo" == "v2ray" && -f "$V2RAY_CRED_FILE" ]]; then
+        local vlink; vlink=$(grep -oP '^vmess://\S+' "$V2RAY_CRED_FILE" | head -1)
+        local uuid=""
+        if [[ -n "$vlink" ]]; then
+            uuid=$(echo "${vlink#vmess://}" | base64 -d 2>/dev/null \
+                | python3 -c "import sys,json; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+        fi
+        [[ -n "$uuid" ]] && out="${out}
+
+🆔 UUID V2Ray:
+\`$uuid\`"
+    fi
+
+echo "$out"
+    echo "${user}|${pass}" > "$TEST_GERADO_FILE"
+}
+
+# ══ TESTE GRATUITO DOS CLIENTES · 2H · 1 POR DIA ═════════════
+
+txt_testes_admin(){
+    echo "🧪 *Testes dos clientes*
+
+Cada cliente pode gerar *1 teste de 2h por dia* (a cada 24h) pelo botão *🆓 Gerar Teste*.
+Aqui você vê *quem mais pede* testes, quem *pede todo dia e nunca compra*, e pode *bloquear* quem quiser.
+
+⚠️ O teste é removido automaticamente após 2h."
+}
+
+_reg_test_attempt(){
+    local chat="$1" uname="$2" cnt tmp
+    uname=$(echo "$uname" | tr -d '@')
+    cnt=$(awk -F'|' -v c="$chat" '$1==c{print $3; f=1} END{if(!f) print 0}' "$TEST_STATS_FILE" 2>/dev/null)
+    cnt=$(( ${cnt:-0} + 1 ))
+    tmp=$(grep -v "^${chat}|" "$TEST_STATS_FILE" 2>/dev/null)
+    mkdir -p "$(dirname "$TEST_STATS_FILE")"
+    if [[ -n "$tmp" ]]; then
+        printf '%s\n' "$tmp" > "$TEST_STATS_FILE"
+    else
+        : > "$TEST_STATS_FILE"
+    fi
+    echo "${chat}|${uname}|${cnt}" >> "$TEST_STATS_FILE"
+}
+
+_reg_test_last(){
+    local chat="$1" now tmp
+    now=$(date +%s)
+    tmp=$(grep -v "^${chat}|" "$TEST_LAST_FILE" 2>/dev/null)
+    mkdir -p "$(dirname "$TEST_LAST_FILE")"
+    if [[ -n "$tmp" ]]; then
+        printf '%s\n' "$tmp" > "$TEST_LAST_FILE"
+    else
+        : > "$TEST_LAST_FILE"
+    fi
+    echo "${chat}|${now}" >> "$TEST_LAST_FILE"
+    mkdir -p "$(dirname "$TEST_DAYS_FILE")"
+    echo "${chat}|$(date +%F)" >> "$TEST_DAYS_FILE"
+}
+
+# nº de dias distintos em que o cliente gerou teste
+_test_dias(){
+    awk -F'|' -v c="$1" '$1==c{n++} END{print n+0}' "$TEST_DAYS_FILE" 2>/dev/null
+}
+
+# o cliente já comprou (criou) algum acesso?
+_test_comprou(){
+    cut -d'|' -f2 "$COMPRAS_DB" 2>/dev/null | grep -qx "$1"
+}
+
+# linhas "dias|pedidos|chat|user" ordenadas por dias e depois por pedidos
+_test_summary(){
+    local c u cnt d out=""
+    while IFS='|' read -r c u cnt; do
+        d=$(_test_dias "$c")
+        out="${out}${d}|${cnt}|${c}|${u}\n"
+    done < <(cut -d'|' -f1-3 "$TEST_STATS_FILE" 2>/dev/null)
+    [[ -n "$out" ]] && printf '%b' "$out" | sort -t'|' -k1,1nr -k2,2nr
+}
+
+_toggle_test_block(){
+    local chat="$1"
+    if grep -qx "$chat" "$TEST_BLOCK_FILE" 2>/dev/null; then
+        grep -vx "$chat" "$TEST_BLOCK_FILE" > "${TEST_BLOCK_FILE}.tmp" 2>/dev/null || : > "${TEST_BLOCK_FILE}.tmp"
+        mv "${TEST_BLOCK_FILE}.tmp" "$TEST_BLOCK_FILE"
+        echo "liberado"
+    else
+        mkdir -p "$(dirname "$TEST_BLOCK_FILE")"
+        echo "$chat" >> "$TEST_BLOCK_FILE"
+        echo "bloqueado"
+    fi
+}
+
+build_test_ranking(){
+    local out="🏆 *Quem mais pede testes*
+(1 teste de 2h/dia por cliente)
+🚨 = *nunca comprou* um acesso
+✅ = já comprou
+"
+    local n=0 d cnt c u flag tag
+    while IFS='|' read -r d cnt c u; do
+        n=$((n + 1))
+        _test_comprou "$c" && flag="✅ comprou" || flag="🚨 nunca comprou"
+        tag="—"
+        [[ -n "$u" ]] && tag="@$(md_esc "$u")"
+        out="${out}
+${n}) ${tag} *id ${c}* — ${d} dia(s) · ${cnt} pedido(s) · ${flag}"
+        [[ "$n" -ge 15 ]] && break
+    done < <(_test_summary)
+    [[ "$n" -eq 0 ]] && out="${out}
+(Nenhum pedido ainda.)"
+    echo "$out"
+}
+
+build_test_suspeitos(){
+    local out="🚨 *Só pede teste, nunca compra*
+Quem usa o *teste grátis* repetidamente mas *nunca adquiriu* um acesso:
+"
+    local n=0 d cnt c u tag
+    while IFS='|' read -r d cnt c u; do
+        [[ "$d" -lt 2 && "$cnt" -lt 3 ]] && continue
+        _test_comprou "$c" && continue
+        n=$((n + 1))
+        tag="—"
+        [[ -n "$u" ]] && tag="@$(md_esc "$u")"
+        out="${out}
+${n}) ${tag} *id ${c}* — ${d} dia(s) · ${cnt} pedido(s)"
+        [[ "$n" -ge 15 ]] && break
+    done < <(_test_summary)
+    [[ "$n" -eq 0 ]] && out="${out}
+(Nenhum suspeito ainda.)"
+    echo "$out"
+}
+
+build_block_list(){
+    local out="🚫 *Bloqueados para Gerar Teste*"
+    local n=0 c u
+    while read -r c; do
+        [[ -z "$c" ]] && continue
+        n=$((n + 1))
+        u=$(awk -F'|' -v c="$c" '$1==c{print $2; exit}' "$TEST_STATS_FILE" 2>/dev/null)
+        out="${out}
+${n}) ${u:+@$(md_esc "$u") }*id ${c}*"
+    done < "$TEST_BLOCK_FILE"
+    [[ "$n" -eq 0 ]] && out="${out}
+(ninguém bloqueado)"
+    echo "$out"
+}
+
+gerar_teste_cliente(){
+    local chat="$1" cbid="$2" uname="$3"
+    _reg_test_attempt "$chat" "$uname"
+
+    if grep -qx "$chat" "$TEST_BLOCK_FILE" 2>/dev/null; then
+        tg_answer_cb "$cbid" "🚫 Você está bloqueado."
+        tg_send_to "$chat" "🚫 *Testes bloqueados* para você.
+Se acha que é um engano, procure o *suporte*."
+        return
+    fi
+
+    local last now
+    last=$(awk -F'|' -v c="$chat" '$1==c{print $2}' "$TEST_LAST_FILE" 2>/dev/null)
+    now=$(date +%s)
+    if [[ -n "$last" ]] && (( now - last < 86400 )); then
+        local rem=$(( 86400 - (now - last) ))
+        local h=$(( rem / 3600 )) m=$(( (rem % 3600) / 60 ))
+        tg_answer_cb "$cbid" "Limite: 1 teste por dia."
+        tg_send_to "$chat" "⏳ *Você já usou seu teste gratuito hoje.*
+⏱ Pode gerar outro em *${h}h ${m}min*."
+        return
+    fi
+
+    tg_answer_cb "$cbid" "Gerando seu teste de 2h..."
+    local out; out=$(do_teste_auto "2" "ssh")
+    if [[ "$out" == *"✅"* ]]; then
+        _reg_test_last "$chat"
+        local dmsg exp tuser tpass
+        IFS='|' read -r tuser tpass < "$TEST_GERADO_FILE" 2>/dev/null
+        exp=$(date -d "+2 hours" "+%d/%m/%Y %H:%M")
+        dmsg=$(cat "$DELIVER_MSG_FILE" 2>/dev/null)
+        dmsg=$(echo "$dmsg" | sed "s|{login}|${tuser}|g; s|{senha}|${tpass}|g; s|{validade}|${exp}|g; s|{plano}|Teste 2h|g")
+        tg_send_to "$chat" "${out}
+
+🆓 *Teste gratuito* — expira em *2h* e é removido automaticamente.
+⏳ Limite: *1 teste a cada 24h*."
+        [[ -n "$dmsg" ]] && tg_send_to "$chat" "$dmsg"
+    else
+        tg_send_to "$chat" "❌ Não consegui gerar o teste agora. Tente novamente em alguns minutos.
+$out"
+    fi
+}
+
+do_remover(){
+    local user="$1"
+    if [[ -z "$user" ]]; then
+        echo "❌ Formato inválido. Use: usuario"
+        return
+    fi
+    local result; result=$(ssh_remove_api "$user" 2>&1)
+    if [[ "$result" == "REMOVIDOCOMSUCESSO" ]]; then
+        echo "✅ Usuário *$user* removido."
+    else
+        echo "❌ Erro: $result"
+    fi
+}
+
+do_backup(){
+    mkdir -p "$BACKUP_DIR"
+    local ts; ts=$(date +%Y%m%d_%H%M%S)
+    local file="$BACKUP_DIR/vpnbackup_$ts.tar.gz"
+
+    # monta a lista só com o que existir de fato no servidor (evita
+    # que o tar erre por causa de caminho/serviço que não existe)
+    shopt -s nullglob
+    local candidates=(
+        /etc/passwd
+        /etc/shadow
+        /etc/group
+        /etc/ssh/sshd_config
+        /root/pm_users.db
+        /etc/SSHPlus
+        /usr/local/etc/xray/config.json
+        /usr/local/etc/v2ray/config.json
+        "$INSTALL_DIR/conf"
+        "$INSTALL_DIR/bin"
+        /etc/systemd/system/vpnproxy-*.service
+        /etc/systemd/system/badvpn-*.service
+    )
+    shopt -u nullglob
+
+    local paths=()
+    for p in "${candidates[@]}"; do
+        [[ -e "$p" ]] && paths+=("$p")
+    done
+
+    tar -czf "$file" "${paths[@]}" 2>/dev/null
+
+    if [[ -f "$file" ]]; then
+        tg_send_file "$file" "🗂 Backup completo $ts"
+        echo "✅ *Backup enviado:* \`vpnbackup_$ts.tar.gz\`
+
+Inclui usuários SSH (e senhas), limites, configurações e credenciais Xray/V2Ray, portas abertas e ajustes do SSH.
+
+Envie este arquivo de volta pra mim quando quiser restaurar."
+    else
+        echo "❌ Falha ao gerar backup."
+    fi
+}
+
+# restaura um backup .tar.gz que o usuário enviou como documento.
+# \$1 = caminho local do arquivo já baixado
+do_restore(){
+    local tarfile="$1"
+
+    if [[ ! -f "$tarfile" ]]; then
+        echo "❌ Arquivo de backup não encontrado (pode ter expirado). Envie novamente."
+        return
+    fi
+
+    if ! tar -tzf "$tarfile" > /dev/null 2>&1; then
+        rm -f "$tarfile"
+        echo "❌ Arquivo inválido — não parece ser um backup .tar.gz do VPNManager."
+        return
+    fi
+
+    # backup de segurança do estado atual, antes de sobrescrever
+    mkdir -p "$BACKUP_DIR"
+    local ts; ts=$(date +%Y%m%d_%H%M%S)
+    tar -czf "$BACKUP_DIR/pre_restore_$ts.tar.gz" \
+        /etc/passwd /etc/shadow /etc/group \
+        "$PM_DB" "$INSTALL_DIR/conf" 2>/dev/null
+
+    tar -xzf "$tarfile" -C / 2>/dev/null
+    local rc=$?
+    rm -f "$tarfile"
+
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    systemctl restart xray 2>/dev/null
+    systemctl restart v2ray 2>/dev/null
+    systemctl daemon-reload 2>/dev/null
+    for svc in /etc/systemd/system/vpnproxy-*.service /etc/systemd/system/badvpn-*.service; do
+        [[ -f "$svc" ]] || continue
+        systemctl restart "$(basename "$svc" .service)" 2>/dev/null
+    done
+
+    if [[ $rc -eq 0 ]]; then
+        echo "✅ *Backup restaurado com sucesso!*
+
+Usuários SSH, senhas, limites, configurações e credenciais Xray/V2Ray foram restaurados. Serviços reiniciados.
+
+Uma cópia de segurança do estado anterior foi salva em \`pre_restore_$ts.tar.gz\`."
+    else
+        echo "⚠️ Backup restaurado, mas com avisos durante a extração. Confira os serviços manualmente.
+
+Cópia de segurança do estado anterior: \`pre_restore_$ts.tar.gz\`."
+    fi
+}
+
+# ── Gerenciar servidor ────────────────────────────────────────
+
+do_server_reboot(){
+    nohup bash -c "sleep 3 && reboot" >/dev/null 2>&1 &
+    echo "🔄 Reiniciando o servidor... a conexão pode cair por alguns minutos."
+}
+
+do_server_iptables_flush(){
+    iptables -F 2>/dev/null
+    iptables -t nat -F 2>/dev/null
+    echo "🧹 Regras do iptables limpas (\`iptables -F\`)."
+}
+
+do_server_rootpass(){
+    local newpass; newpass="$(gen_rand 12)"
+    if echo "root:${newpass}" | chpasswd 2>/dev/null; then
+        echo "🔑 *Senha do root alterada!*
+
+Usuário: \`root\`
+Senha  : \`${newpass}\`
+
+⚠️ Guarde agora — essa senha não será mostrada de novo."
+    else
+        echo "❌ Falha ao trocar a senha do root."
+    fi
+}
+
+build_server_ports(){
+    local lista=""
+    while IFS='|' read -r proc port; do
+        [[ -z "$port" ]] && continue
+        lista="${lista}
+🔓 \`$port\` — $proc"
+    done < <(_sys_services)
+    if [[ -z "$lista" ]]; then
+        echo "🔓 *Portas abertas*
+Nenhuma porta encontrada."
+    else
+        echo "🔓 *Portas abertas*${lista}"
+    fi
+}
+
+# ── Assistente (pede uma resposta de texto ao usuário) ────────
+
+start_wizard(){
+    # $1 = criar|remover   $2 = texto do prompt
+    local resp; resp=$(tg_send_force "$2")
+    local mid; mid=$(echo "$resp" | extract_msg_id)
+    [[ -n "$mid" ]] && echo "$mid" > "$PROMPT_MSG_FILE"
+    echo "$1" > "$PENDING_FILE"
+}
+
+finish_wizard(){
+    # $1 = texto que o usuário respondeu
+    local action; action=$(cat "$PENDING_FILE" 2>/dev/null)
+    rm -f "$PENDING_FILE"
+
+    if [[ -f "$PROMPT_MSG_FILE" ]]; then
+        tg_delete "$(cat "$PROMPT_MSG_FILE")"
+        rm -f "$PROMPT_MSG_FILE"
+    fi
+
+    local raw="$1"
+    local out=""
+
+    case "$action" in
+        mp)
+            _mp_load
+            MP_TOKEN="$(echo "$raw" | xargs)"
+            if [[ -z "$MP_TOKEN" ]]; then
+                out="❌ Token não pode ser vazio."
+            else
+                local test_resp
+                test_resp=$(curl -s --max-time 15 -H "Authorization: Bearer $MP_TOKEN" "https://api.mercadopago.com/v1/payments/search?limit=1")
+                if echo "$test_resp" | grep -q '"status":401' || echo "$test_resp" | grep -q '"error"'; then
+                    out="❌ *Token inválido.* Não consegui autenticar no Mercado Pago.
+Verifique o Access Token."
+                else
+                    [[ "$MP_STORE_ENABLED" != "1" ]] && MP_STORE_ENABLED="1"
+                    _mp_save
+                    out="✅ *Mercado Pago configurado!*
+Loja de vendas *ativada*.
+Token: \`${MP_TOKEN:0:12}\`..."
+                fi
+            fi
+            ;;
+        msgentrega)
+            [[ -n "$raw" ]] && echo "$raw" > "$DELIVER_MSG_FILE"
+            out="✉️ *Mensagem de entrega atualizada!*
+
+$(cat "$DELIVER_MSG_FILE")
+"
+            ;;
+        divulgar)
+            local texto="$raw"
+            if [[ -z "$texto" ]]; then
+                out="❌ Mensagem vazia. Nada foi enviado."
+            else
+                out="📣 *Divulgação enviada!*
+👥 Clientes cadastrados: $(wc -l < "$CLIENTES_FILE" 2>/dev/null | tr -d ' ')"
+                local total=0 entregues=0 c u resp
+                while IFS='|' read -r c u; do
+                    [[ -z "$c" || "$c" == "$BOT_CHAT_ID" ]] && continue
+                    total=$((total + 1))
+                    resp=$(tg_send_to_resp "$c" "$texto")
+                    if ! echo "$resp" | grep -q '"ok":true'; then
+                        resp=$(curl -s --max-time 12 -X POST "${API}/sendMessage" -d "chat_id=${c}" --data-urlencode "text=${texto}")
+                    fi
+                    echo "$resp" | grep -q '"ok":true' && entregues=$((entregues + 1))
+                done < "$CLIENTES_FILE"
+                out="${out}
+📨 Enviado para: *${total}* → *${entregues}* entregues."
+            fi
+            ;;
+        tblock)
+            local raw alvo chat_t="" nome=""
+            raw=$(echo "$raw" | xargs)
+            if [[ "$raw" =~ ^[0-9]+$ ]]; then
+                chat_t="$raw"
+            else
+                local un; un=$(echo "$raw" | tr -d '@' | tr '[:upper:]' '[:lower:]')
+                chat_t=$(awk -F'|' -v u="$un" '{n=$2; sub(/^@/,"",n); if (tolower(n)==u){print $1; exit}}' "$TEST_STATS_FILE" 2>/dev/null)
+            fi
+            if [[ -z "$chat_t" ]]; then
+                out="❌ Cliente não encontrado.
+Só aparece quem já usou o botão *🆓 Gerar Teste* pelo menos uma vez."
+            else
+                nome=$(awk -F'|' -v c="$chat_t" '$1==c{print $2; exit}' "$TEST_STATS_FILE" 2>/dev/null)
+                local st; st=$(_toggle_test_block "$chat_t")
+                out="✅ *Teste ${st}* para ${nome:+@$(md_esc "$nome") }(id \`${chat_t}\`)
+Ele está ${st} para *Gerar Teste*."
+            fi
+            ;;
+        addplano_tipo)
+            local u
+            u=$(echo "$raw" | tr '[:upper:]' '[:lower:]' | tr -d ' ')
+            case "$u" in
+                d*)  u="dia" ;;
+                m*)  u="mes" ;;
+                *)
+                    tg_send "❌ Responda apenas *dias* ou *meses*." > /dev/null 2>&1
+                    start_wizard "addplano_tipo" "➕ *Adicionar plano de login*
+
+O acesso é por *dias* ou por *meses*?
+Responda: \`dias\` ou \`meses\`"
+                    return
+                    ;;
+            esac
+            echo "$u" > "$PLAN_UNIT_FILE"
+            start_wizard "addplano_qtd" "📅 Quantos *$( [[ "$u" == "mes" ]] && echo meses || echo dias )* de acesso?"
+            return
+            ;;
+        addplano_qtd)
+            local u qtd
+            u=$(cat "$PLAN_UNIT_FILE" 2>/dev/null); [[ -z "$u" ]] && u="dia"
+            qtd=$(echo "$raw" | tr -dc '0-9')
+            if [[ -z "$qtd" || "$qtd" -lt 1 || "$qtd" -gt 1200 ]]; then
+                tg_send "❌ Informe um número de 1 a 1200." > /dev/null 2>&1
+                start_wizard "addplano_qtd" "📅 Quantos *$( [[ "$u" == "mes" ]] && echo meses || echo dias )* de acesso?"
+                return
+            fi
+            echo "$qtd" > "$PLAN_QTD_FILE"
+            start_wizard "addplano_valor" "💵 Qual o *valor* do acesso? Use ponto decimal (ex: \`19.90\`)"
+            return
+            ;;
+        addplano_valor)
+            local u qtd nome dias_total valor
+            u=$(cat "$PLAN_UNIT_FILE" 2>/dev/null); [[ -z "$u" ]] && u="dia"
+            qtd=$(cat "$PLAN_QTD_FILE" 2>/dev/null); [[ -z "$qtd" ]] && qtd=1
+            valor=$(echo "$raw" | xargs)
+            if [[ ! "$valor" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+                tg_send "❌ Valor inválido. Use ponto decimal (ex: \`19.90\`)." > /dev/null 2>&1
+                start_wizard "addplano_valor" "💵 Qual o *valor* do acesso? (ex: \`19.90\`)"
+                return
+            fi
+            if [[ "$u" == "mes" ]]; then
+                dias_total=$(( qtd * 30 ))
+                nome="$qtd mes"; [[ "$qtd" -gt 1 ]] && nome="$qtd meses"
+            else
+                dias_total=$qtd
+                nome="$qtd dia"; [[ "$qtd" -gt 1 ]] && nome="$qtd dias"
+            fi
+            rm -f "$PLAN_UNIT_FILE" "$PLAN_QTD_FILE"
+            plano_add "$nome" "$dias_total" "$valor"
+            out="✅ *Plano adicionado!*
+
+${nome} — ${dias_total} dias — R\$${valor}"
+            ;;
+        *)
+            read -ra a <<< "$raw"
+            case "$action" in
+                criar)   out=$(do_criar "${a[0]}" "${a[1]}" "${a[2]}" "${a[3]}") ;;
+                remover) out=$(do_remover "${a[0]}") ;;
+                *) rm -f "$PLAN_UNIT_FILE" "$PLAN_QTD_FILE"; return ;;
+            esac
+            ;;
+    esac
+
+    tg_send "$out" > /dev/null 2>&1
+    show_screen "$(txt_main)" "$KB_MAIN"
+}
+
+# ── Loop principal ────────────────────────────────────────────
+
+_deliver_msg_default
+
+OFFSET=0
+[[ -f "$OFFSET_FILE" ]] && OFFSET=$(cat "$OFFSET_FILE")
+
+while true; do
+    # garante mensagem padrão de entrega e checa PIX em background
+    # (nunca bloqueia o loop da navegação/atendimento do bot)
+    _deliver_msg_default
+    pix_poll_start
+
+    # verifica se é hora do auto backup (roda a cada volta do loop,
+    # aproximadamente a cada 30s por causa do long-polling abaixo)
+    _autobackup_load
+    if [[ "$AUTO_BACKUP_ENABLED" == "1" ]]; then
+        now_ts=$(date +%s)
+        elapsed=$(( now_ts - ${AUTO_BACKUP_LAST:-0} ))
+        if (( elapsed >= AUTO_BACKUP_INTERVAL )); then
+            out=$(do_backup)
+            tg_send "🔁 *Auto backup*
+$out" > /dev/null 2>&1
+            AUTO_BACKUP_LAST=$now_ts
+            _autobackup_save
+        fi
+    fi
+
+    updates=$(curl -s --max-time 35 \
+        "${API}/getUpdates?offset=${OFFSET}&timeout=30")
+
+    if [[ -z "$updates" || "$updates" == *'"ok":false'* ]]; then
+        sleep 2; continue
+    fi
+
+    while IFS= read -r update; do
+        [[ -z "$update" ]] && continue
+
+        update_id=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('update_id',''))" 2>/dev/null)
+        [[ -z "$update_id" ]] && continue
+        OFFSET=$(( update_id + 1 ))
+        echo "$OFFSET" > "$OFFSET_FILE"
+
+        # ── botão pressionado (callback_query) ──
+        cb_id=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('callback_query',{}).get('id',''))" 2>/dev/null)
+
+        if [[ -n "$cb_id" ]]; then
+            cb_chat=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('callback_query',{}).get('message',{}).get('chat',{}).get('id',''))" 2>/dev/null)
+            cb_data=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('callback_query',{}).get('data',''))" 2>/dev/null)
+
+            # ── loja: compra / renovação de clientes (qualquer chat) ──
+            case "$cb_data" in
+                buy_*)
+                    _registra_cliente "$cb_chat" ""
+                    tg_answer_cb "$cb_id" "Gerando seu pedido..."
+                    do_make_pedido "${cb_data#buy_}" "$cb_chat" "$cb_id" "create"
+                    continue
+                    ;;
+                ren_*)
+                    _registra_cliente "$cb_chat" ""
+                    rlogin=$(cat "/tmp/vpnbot_cli_renew_${cb_chat}" 2>/dev/null)
+                    if [[ -z "$rlogin" ]]; then
+                        tg_answer_cb "$cb_id" "Use /renovar primeiro."
+                        continue
+                    fi
+                    rm -f "/tmp/vpnbot_cli_renew_${cb_chat}"
+                    tg_answer_cb "$cb_id" "Gerando renovação..."
+                    do_make_pedido "${cb_data#ren_}" "$cb_chat" "$cb_id" "renew" "$rlogin"
+                    continue
+                    ;;
+                m_renew)
+                    _registra_cliente "$cb_chat" ""
+                    tg_answer_cb "$cb_id" "Digite seu login."
+                    tg_send_to "$cb_chat" "✏️ *Renovar acesso*
+
+Envie o *login* que você quer renovar (o mesmo que você recebeu na sua compra):" '{"force_reply":true,"selective":true}'
+                    echo "renew_login" > "/tmp/vpnbot_cli_pending_${cb_chat}"
+                    continue
+                    ;;
+                cli_teste)
+                    cb_uname=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('callback_query',{}).get('from',{}).get('username',''))" 2>/dev/null)
+                    _registra_cliente "$cb_chat" "$cb_uname"
+                    gerar_teste_cliente "$cb_chat" "$cb_id" "$cb_uname"
+                    continue
+                    ;;
+            esac
+
+            if [[ "$cb_chat" != "$BOT_CHAT_ID" ]]; then
+                tg_answer_cb "$cb_id" ""
+                continue
+            fi
+
+            tg_answer_cb "$cb_id" ""
+
+            case "$cb_data" in
+                m_main)    show_screen "$(txt_main)"  "$KB_MAIN"  ;;
+                m_users)   show_screen "$(txt_users)" "$KB_USERS" ;;
+                m_ajuda)   show_screen "$(txt_ajuda)" "$KB_BACK"  ;;
+                m_server)  show_screen "$(txt_server)" "$KB_SERVER" ;;
+                m_backup)  show_screen "$(txt_backup)" "$(kb_backup)" ;;
+                c_onlines) show_screen "$(build_onlines)" "$KB_BACK" ;;
+                c_status)  show_screen "$(build_status)"  "$KB_BACK" ;;
+                c_listar)  show_screen "$(build_listar)"  "$KB_USERS" ;;
+                c_backup)
+                    show_screen "📦 Gerando backup... aguarde." "$(kb_backup)"
+                    out=$(do_backup)
+                    show_screen "$out" "$(kb_backup)"
+                    ;;
+                c_autobackup_toggle)
+                    _autobackup_load
+                    if [[ "$AUTO_BACKUP_ENABLED" == "1" ]]; then
+                        AUTO_BACKUP_ENABLED="0"
+                    else
+                        AUTO_BACKUP_ENABLED="1"
+                        AUTO_BACKUP_LAST=$(date +%s)
+                    fi
+                    _autobackup_save
+                    show_screen "$(txt_backup)" "$(kb_backup)"
+                    ;;
+                w_criar)
+                    start_wizard "criar" "✏️ *Criar usuário*
+Envie: \`usuario senha dias limite\`
+(dias=0 = sem expiração, limite=0 = ilimitado)"
+                    ;;
+                w_teste)
+                    show_screen "$(txt_teste_duracao)" "$KB_TESTE_DURACAO"
+                    ;;
+                w_remover)
+                    start_wizard "remover" "✏️ *Remover usuário*
+Envie: \`usuario\`"
+                    ;;
+                td_1|td_2|td_4)
+                    echo "${cb_data#td_}" > "$TESTE_STATE_FILE"
+                    show_screen "$(txt_teste_protocolo)" "$(kb_teste_protocolo)"
+                    ;;
+                tp_ssh|tp_xray|tp_v2ray)
+                    hrs=$(cat "$TESTE_STATE_FILE" 2>/dev/null); hrs="${hrs:-1}"
+                    rm -f "$TESTE_STATE_FILE"
+                    proto="${cb_data#tp_}"
+                    show_screen "⏳ Gerando teste (${hrs}h — ${proto})..." "$KB_USERS"
+                    out=$(do_teste_auto "$hrs" "$proto")
+                    tg_send "$out" > /dev/null 2>&1
+                    show_screen "$(txt_main)" "$KB_MAIN"
+                    ;;
+                sv_reboot)
+                    show_screen "🔄 *Reiniciar VPS*
+Tem certeza? A conexão SSH e o bot vão cair por alguns instantes." "$KB_CONFIRM_REBOOT"
+                    ;;
+                sv_reboot_yes)
+                    out=$(do_server_reboot)
+                    show_screen "$out" "$KB_SERVER_BACK"
+                    ;;
+                sv_iptables)
+                    show_screen "🧹 *Limpar iptables*
+Isso remove TODAS as regras de firewall atuais. Continuar?" "$KB_CONFIRM_IPTABLES"
+                    ;;
+                sv_iptables_yes)
+                    out=$(do_server_iptables_flush)
+                    show_screen "$out" "$KB_SERVER_BACK"
+                    ;;
+                sv_rootpass)
+                    show_screen "🔑 *Trocar senha do root*
+Uma nova senha aleatória será gerada. Continuar?" "$KB_CONFIRM_ROOTPASS"
+                    ;;
+                sv_rootpass_yes)
+                    out=$(do_server_rootpass)
+                    show_screen "$out" "$KB_SERVER_BACK"
+                    ;;
+                sv_ports)
+                    show_screen "$(build_server_ports)" "$KB_SERVER_BACK"
+                    ;;
+                sv_ramclean)
+                    show_screen "$(do_ramclean)" "$KB_SERVER_BACK"
+                    ;;
+                rs_yes)
+                    show_screen "⏳ Restaurando backup... aguarde." "$KB_BACK"
+                    out=$(do_restore "$RESTORE_TMP_FILE")
+                    tg_send "$out" > /dev/null 2>&1
+                    show_screen "$(txt_main)" "$KB_MAIN"
+                    ;;
+                rs_no)
+                    rm -f "$RESTORE_TMP_FILE"
+                    show_screen "❌ Restauração cancelada." "$KB_MAIN"
+                    ;;
+                m_loja)    show_screen "$(txt_loja_admin)" "$KB_LOJA" ;;
+                m_testes)  show_screen "$(txt_testes_admin)" "$KB_TESTES" ;;
+                t_rank)    show_screen "$(build_test_ranking)" "$KB_TESTES" ;;
+                t_sus)     show_screen "$(build_test_suspeitos)" "$KB_TESTES" ;;
+                t_list)    show_screen "$(build_block_list)" "$KB_TESTES" ;;
+                t_block)   start_wizard "tblock" "🚫 *Bloquear / liberar testes*
+
+Envie o *@usuário* ou o *ID* do cliente.
+⚠️ O mesmo comando *bloqueia* e *libera* (alterna)."
+                    ;;
+                m_divulgar) start_wizard "divulgar" "📣 *Divulgação para todos os clientes!*
+
+Envie a *mensagem* que quer mandar para todo mundo que já usou o bot.
+Pode usar *negrito*, _itálico_, código \`assim\`, emojis, etc.
+
+⚠️ Cuidado com promoções excessivas — o cliente pode bloquear o bot."
+                    ;;
+                a_mp)
+                    start_wizard "mp" "💰 *Mercado Pago — Access Token*
+
+Envie o *Access Token* do seu painel Mercado Pago.
+(Painel → Seus integrações → Credenciais → Access Token)"
+                    ;;
+                a_msg)
+                    start_wizard "msgentrega" "✉️ *Mensagem de entrega*
+
+Envie o texto que o cliente recebe quando o *pagamento é aprovado*.
+
+Variáveis disponíveis:
+{login}  {senha}  {validade}  {plano}"
+                    show_screen "$(cat "$DELIVER_MSG_FILE" 2>/dev/null)" "$KB_MSGENTREGA"
+                    ;;
+                a_msg_reset)
+                    _deliver_msg_default
+                    show_screen "✉️ Mensagem restaurada para o padrão." "$KB_MSGENTREGA"
+                    ;;
+                m_planos)  show_screen "$(txt_planos_admin)" "$(kb_planos)" ;;
+                a_addplano)
+                    rm -f "$PLAN_UNIT_FILE" "$PLAN_QTD_FILE" "$PENDING_FILE"
+                    start_wizard "addplano_tipo" "➕ *Adicionar plano de login*
+
+O acesso é por *dias* ou por *meses*?
+Responda: \`dias\` ou \`meses\`"
+                    ;;
+                a_compras) show_screen "$(build_compras)" "$KB_LOJA" ;;
+                a_loja)
+                    _mp_load
+                    if [[ "$MP_STORE_ENABLED" == "1" ]]; then
+                        MP_STORE_ENABLED="0"
+                    else
+                        MP_STORE_ENABLED="1"
+                    fi
+                    _mp_save
+                    show_screen "$(txt_loja_admin)" "$KB_LOJA"
+                    ;;
+                rp_*)
+                    plano_remove "${cb_data#rp_}"
+                    show_screen "$(txt_planos_admin)" "$(kb_planos)"
+                    ;;
+            esac
+            continue
+        fi
+
+        # ── documento enviado (possível backup para restaurar) ──
+        doc_chat=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('chat',{}).get('id',''))" 2>/dev/null)
+        doc_file_id=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('document',{}).get('file_id',''))" 2>/dev/null)
+
+        if [[ -n "$doc_file_id" && "$doc_chat" == "$BOT_CHAT_ID" ]]; then
+            doc_name=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('document',{}).get('file_name',''))" 2>/dev/null)
+
+            if tg_download_file "$doc_file_id" "$RESTORE_TMP_FILE" && [[ -s "$RESTORE_TMP_FILE" ]]; then
+                tg_send_kb "📦 Arquivo recebido: \`${doc_name:-backup}\`
+
+Deseja *restaurar* este backup agora? Isso vai sobrescrever usuários SSH, senhas, configurações e credenciais Xray/V2Ray atuais." "$KB_CONFIRM_RESTORE" > /dev/null 2>&1
+            else
+                tg_send "❌ Não consegui baixar o arquivo enviado. Tente novamente." > /dev/null 2>&1
+            fi
+            continue
+        fi
+
+        # ── mensagem de texto normal ──
+        from_chat=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('chat',{}).get('id',''))" 2>/dev/null)
+
+        text=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('text',''))" 2>/dev/null)
+        [[ -z "$text" ]] && continue
+
+        # ── cliente (qualquer chat que não seja o admin) ──────────
+        if [[ "$from_chat" != "$BOT_CHAT_ID" ]]; then
+            cli_pending="/tmp/vpnbot_cli_pending_${from_chat}"
+            # resposta do assistente do cliente (ex: /renovar)
+            if [[ -f "$cli_pending" ]]; then
+                cli_state=$(cat "$cli_pending" 2>/dev/null)
+                rm -f "$cli_pending"
+                cli_login=$(echo "$text" | xargs)
+                if getent passwd "$cli_login" > /dev/null 2>&1; then
+                    echo "$cli_login" > "/tmp/vpnbot_cli_renew_${from_chat}"
+                    _mp_load
+                    if [[ "$MP_STORE_ENABLED" == "1" && -n "$MP_TOKEN" ]]; then
+                        tg_send_to "$from_chat" "✅ Conta \`${cli_login}\` encontrada! Escolha o plano de *renovação*:" "$(kb_loja_cliente ren)"
+                    else
+                        tg_send_to "$from_chat" "🛒 Loja indisponível no momento."
+                    fi
+                else
+                    tg_send_to "$from_chat" "❌ Login \`${cli_login}\` não encontrado. Verifique e envie o login correto, ou chame o suporte."
+                fi
+                continue
+            fi
+
+            cmd_c=$(echo "$text" | awk '{print $1}' | sed 's/@.*//' | tr '[:upper:]' '[:lower:]')
+            case "$cmd_c" in
+                /start|/menu|/comprar)
+                    cb_uname=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('from',{}).get('username',''))" 2>/dev/null)
+                    _registra_cliente "$from_chat" "$cb_uname"
+                    rm -f "/tmp/vpnbot_cli_renew_${from_chat}"
+                    cliente_abrir_loja "$from_chat"
+                    ;;
+                /renovar)
+                    _registra_cliente "$from_chat" ""
+                    tg_send_to "$from_chat" "✏️ *Renovar acesso*
+
+Envie o *login* que você quer renovar (o mesmo que você recebeu na sua compra):" '{"force_reply":true,"selective":true}'
+                    echo "renew_login" > "$cli_pending"
+                    ;;
+            esac
+            continue
+        fi
+
+        # se há um assistente pendente e a mensagem não é comando, trata como resposta
+        if [[ -f "$PENDING_FILE" && "${text:0:1}" != "/" ]]; then
+            finish_wizard "$text"
+            continue
+        fi
+
+        cmd=$(echo "$text" | awk '{print $1}' | sed 's/@.*//' | tr '[:upper:]' '[:lower:]')
+        args=($(echo "$text" | awk '{for(i=2;i<=NF;i++) printf $i" "; print ""}'))
+
+        case "$cmd" in
+            /criar)     tg_send "$(do_criar "${args[0]}" "${args[1]}" "${args[2]}" "${args[3]}")" > /dev/null 2>&1 ;;
+            /teste)     tg_send "$(do_teste_manual "${args[0]}" "${args[1]}" "${args[2]}")" > /dev/null 2>&1 ;;
+            /remover)   tg_send "$(do_remover "${args[0]}")" > /dev/null 2>&1 ;;
+            /listar)    tg_send "$(build_listar)" > /dev/null 2>&1 ;;
+            /onlines)   tg_send "$(build_onlines)" > /dev/null 2>&1 ;;
+            /status)    tg_send "$(build_status)" > /dev/null 2>&1 ;;
+            /backup)    tg_send "📦 Gerando backup... aguarde." > /dev/null 2>&1; tg_send "$(do_backup)" > /dev/null 2>&1 ;;
+            /compras)   tg_send "$(build_compras)" > /dev/null 2>&1 ;;
+            /loja)      show_screen "$(txt_loja_admin)" "$KB_LOJA" ;;
+            /start|/menu)
+                # cancela qualquer assistente pendente e recomeça limpo
+                # (respostas podem ter sido capturadas por outro bot usando o mesmo token)
+                rm -f "$SCREEN_MSG_FILE" "$PENDING_FILE" "$PLAN_UNIT_FILE" "$PLAN_QTD_FILE" "$PROMPT_MSG_FILE"
+                show_screen "$(txt_main)" "$KB_MAIN"
+                ;;
+            /cancelar)
+                rm -f "$PENDING_FILE" "$PLAN_UNIT_FILE" "$PLAN_QTD_FILE" "$PROMPT_MSG_FILE"
+                tg_send "✅ Assistente cancelado. Envie /start para abrir o menu." > /dev/null 2>&1
+                ;;
+            /ajuda|/help) show_screen "$(txt_ajuda)" "$KB_BACK" ;;
+        esac
+
+    done < <(echo "$updates" | python3 -c "
+import sys,json
+data=json.load(sys.stdin)
+for r in data.get('result',[]):
+    print(json.dumps(r))
+" 2>/dev/null)
+
+done
+WORKEREOF
+
+    chmod +x "$BOT_SCRIPT"
+}
+
+# ── Serviço systemd ───────────────────────────────────────────
+
+_write_bot_service(){
+    cat > "$BOT_SERVICE" << SVC
+[Unit]
+Description=VPNManager Telegram Bot
+After=network.target
+
+[Service]
+User=root
+ExecStart=/bin/bash ${BOT_SCRIPT}
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+SVC
+    systemctl daemon-reload
+}
+
+# ── Instalação principal ──────────────────────────────────────
+
+telegram_bot_install(){
+    clear
+    echo -e "${C_CYAN}== Configurar Bot Telegram ==${C_NC}"
+    echo
+    echo " Como obter o token:"
+    echo "  1. Abra o Telegram e fale com @BotFather"
+    echo "  2. Envie /newbot e siga as instruções"
+    echo "  3. Copie o token gerado (ex: 123456:ABC-DEF...)"
+    echo
+    read -p " Token do bot: " token
+    [[ -z "$token" ]] && { fail "Token não pode ser vazio."; pause; return; }
+
+    echo
+    echo " Como obter seu Chat ID:"
+    echo "  1. Fale com @userinfobot no Telegram"
+    echo "  2. Ele responde com seu ID numérico"
+    echo "  Ou fale com o bot e acesse:"
+    echo "  https://api.telegram.org/bot${token}/getUpdates"
+    echo
+    read -p " Seu Chat ID (numérico): " chat_id
+    [[ -z "$chat_id" ]] && { fail "Chat ID não pode ser vazio."; pause; return; }
+
+    # testa o token
+    msg "Testando conexão com a API Telegram..."
+    local test_result
+    test_result=$(curl -s --max-time 10 \
+        "https://api.telegram.org/bot${token}/getMe")
+    if echo "$test_result" | grep -q '"ok":true'; then
+        local bot_name
+        bot_name=$(echo "$test_result" | python3 -c \
+            "import sys,json; d=json.load(sys.stdin); \
+             print(d['result'].get('username','?'))" 2>/dev/null)
+        ok "Bot encontrado: @${bot_name}"
+    else
+        fail "Token inválido ou sem conexão com a API Telegram."
+        echo "$test_result"
+        pause; return
+    fi
+
+    # registra a lista de comandos atual no Telegram (aparece no botão
+    # "Menu" do app e no autocomplete de "/"). Sobrescreve qualquer
+    # lista antiga cadastrada em uma versão anterior do bot.
+    curl -s -X POST "https://api.telegram.org/bot${token}/setMyCommands" \
+        -H "Content-Type: application/json" \
+        -d '{"commands":[
+            {"command":"start","description":"Abrir o menu / ver planos da loja"},
+            {"command":"menu","description":"Abrir o menu"},
+            {"command":"comprar","description":"Ver planos e comprar acesso"},
+            {"command":"renovar","description":"Renovar meu acesso"},
+            {"command":"cancelar","description":"Cancelar assistente/função pendente"},
+            {"command":"criar","description":"Criar usuário SSH"},
+            {"command":"teste","description":"Criar usuário teste"},
+            {"command":"remover","description":"Remover usuário SSH"},
+            {"command":"listar","description":"Listar usuários"},
+            {"command":"onlines","description":"Usuários online agora"},
+            {"command":"status","description":"Status dos serviços"},
+            {"command":"backup","description":"Gerar backup completo"},
+            {"command":"compras","description":"Compras realizadas (admin)"},
+            {"command":"loja","description":"Configurar a loja (admin)"},
+            {"command":"ajuda","description":"Ajuda"}
+        ]}' > /dev/null 2>&1
+
+    # sobrescreve a descrição/sobre do bot (o card que o Telegram
+    # mostra antes da primeira mensagem) — evita texto antigo/defasado
+    # de uma configuração anterior feita pelo @BotFather.
+    curl -s -X POST "https://api.telegram.org/bot${token}/setMyDescription" \
+        --data-urlencode "description=VPNManager Bot — envie /start para abrir o menu com botões." \
+        > /dev/null 2>&1
+    curl -s -X POST "https://api.telegram.org/bot${token}/setMyShortDescription" \
+        --data-urlencode "short_description=Envie /start para abrir o menu." \
+        > /dev/null 2>&1
+
+    # salva config
+    mkdir -p "$(dirname "$BOT_CONF")"
+    cat > "$BOT_CONF" << CONF
+BOT_TOKEN="$token"
+BOT_CHAT_ID="$chat_id"
+CONF
+    chmod 600 "$BOT_CONF"
+
+    mkdir -p "$BACKUP_DIR"
+    # limpa estado de navegação de uma instalação anterior
+    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz /tmp/vpnbot_pix_pending /tmp/vpnbot_cli_* /tmp/vpnbot_plan_unit /tmp/vpnbot_plan_qtd /tmp/vpnbot_pix_polling
+
+    _write_bot_worker "$token" "$chat_id"
+    _write_bot_service
+
+    systemctl enable vpnbot 2>/dev/null
+    systemctl restart vpnbot
+    sleep 3
+
+    if bot_is_active; then
+        ok "Bot ativo e aguardando mensagens."
+        _tg_send "$token" "$chat_id" \
+            "✅ *VPNManager Bot conectado!*
+
+Envie /start para abrir o menu.
+🛒 A *Loja* (venda de acessos via PIX) é configurada pelo próprio bot em *Loja & Vendas*."
+        ok "Mensagem de boas-vindas enviada."
+    else
+        fail "Bot não iniciou."
+        journalctl -u vpnbot -n 15 --no-pager 2>/dev/null
+        pause; return
+    fi
+
+    echo
+    echo -e "${C_CYAN}════════════════════════════════════════════════════${C_NC}"
+    echo -e "${C_WHITE} BOT CONFIGURADO${C_NC}"
+    echo -e "${C_CYAN}════════════════════════════════════════════════════${C_NC}"
+    echo " Token   : ${token:0:20}..."
+    echo " Chat ID : $chat_id"
+    echo
+    echo " No Telegram, envie /start para abrir o menu de botões."
+    echo -e "${C_CYAN}════════════════════════════════════════════════════${C_NC}"
+    pause
+}
+
+# ── Desinstalar ───────────────────────────────────────────────
+
+telegram_bot_uninstall(){
+    clear
+    echo -e "${C_RED}== Remover Bot Telegram ==${C_NC}"
+    read -p "Confirma remoção? [s/N]: " conf
+    [[ "$conf" =~ ^[sS]$ ]] || return
+    systemctl disable --now vpnbot 2>/dev/null
+    rm -f "$BOT_SERVICE" "$BOT_SCRIPT" "$BOT_CONF" "$BOT_OFFSET_FILE" "$AUTO_BACKUP_CONF"
+    rm -f "$INSTALL_DIR/conf/mercadopago.conf" "$INSTALL_DIR/conf/planos.conf" "$INSTALL_DIR/conf/msg_entrega.txt"
+    rm -f /root/vpnbot_compras.db /tmp/vpnbot_pix_pending /tmp/vpnbot_cli_* /tmp/vpnbot_plan_unit /tmp/vpnbot_plan_qtd /tmp/vpnbot_pix_polling
+    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz
+    systemctl daemon-reload
+    ok "Bot removido."
+    pause
+}
+
+# ── Menu ──────────────────────────────────────────────────────
+
+telegram_bot_menu(){
+    while true; do
+        clear
+        echo -e "${C_CYAN}╔══════════════════════════════════════════════════════════╗${C_NC}"
+        echo -e "${C_CYAN}║${C_WHITE}                    BOT TELEGRAM                           ${C_CYAN}║${C_NC}"
+        echo -e "${C_CYAN}╚══════════════════════════════════════════════════════════╝${C_NC}"
+        echo
+
+        _bot_load_conf
+        if bot_is_configured; then
+            local badge
+            bot_is_active \
+                && badge="${C_GREEN}● ATIVO${C_NC}" \
+                || badge="${C_RED}● PARADO${C_NC}"
+            echo -e " Status  : $badge"
+            echo -e " Chat ID : ${C_GREEN}${BOT_CHAT_ID}${C_NC}"
+            echo -e " Token   : ${C_GREEN}${BOT_TOKEN:0:20}...${C_NC}"
+            echo
+            echo " No Telegram: envie /start para abrir o menu de botões."
+            echo -e "  ${C_YELLOW}Usuários · Online · Status · Backup · Ajuda${C_NC}"
+            echo
+            echo "  1) Reiniciar bot"
+            echo "  2) Reconfigurar"
+            echo "  3) Ver logs"
+            echo "  4) Remover bot"
+            echo "  0) Voltar"
+        else
+            echo -e " ${C_YELLOW}Bot não configurado.${C_NC}"
+            echo
+            echo "  1) Configurar Bot Telegram"
+            echo "  0) Voltar"
+        fi
+        echo
+        read -p " Escolha: " op
+
+        if bot_is_configured; then
+            case $op in
+                1)
+                    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz /tmp/vpnbot_pix_pending /tmp/vpnbot_cli_* /tmp/vpnbot_plan_unit /tmp/vpnbot_plan_qtd /tmp/vpnbot_pix_polling
+                    systemctl restart vpnbot && ok "Reiniciado." || fail "Erro."
+                    sleep 2
+                    ;;
+                2) telegram_bot_uninstall; telegram_bot_install ;;
+                3)
+                    clear
+                    echo -e "${C_CYAN}== Logs do Bot ==${C_NC}"
+                    journalctl -u vpnbot -n 40 --no-pager 2>/dev/null
+                    pause
+                    ;;
+                4) telegram_bot_uninstall ;;
+                0) break ;;
+                *) fail "Opção inválida."; sleep 1 ;;
+            esac
+        else
+            case $op in
+                1) telegram_bot_install ;;
+                0) break ;;
+                *) fail "Opção inválida."; sleep 1 ;;
+            esac
+        fi
+    done
+}

@@ -1,0 +1,44 @@
+#!/bin/bash
+# ram_clean.sh — Limpeza automática de RAM (watchdog de 75% + gatilho manual)
+# Usado pelo worker do bot (botão "🧹 Limpar RAM") e pelo cron /usr/local/bin/ramwatch.sh.
+
+RAM_LIMIT_PCT=75
+RAM_FORCE_PCT=90
+RAM_CLEAN_STATE="/tmp/vpnbot_ramclean_last"
+RAM_CLEAN_LOG="/var/log/ramwatch.log"
+
+# % de uso real da RAM (used/total, igual ao `free`)
+_mem_used_pct(){
+    free | awk '/^Mem/{printf "%d", ($3*100)/$2}'
+}
+
+# limpa os caches da RAM agora (conteúdo de disco inalterado)
+do_ramclean(){
+    sync
+    echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+    echo "🧹 *Limpeza de RAM concluída!*"
+    free -h | awk '/^Mem/{gsub(/^ +/,""); print "💾 Uso atual: "$0}'
+}
+
+# watchdog: se a RAM passar de 75% limpa os caches (no máx. 1x a cada 10 min).
+# se passar de 90%, a limpeza é imediata.
+ram_watchdog(){
+    local pct now last elapsed res
+    pct=$(_mem_used_pct)
+    now=$(date +%s)
+    last=$(cat "$RAM_CLEAN_STATE" 2>/dev/null)
+    if [[ -n "$last" ]]; then
+        elapsed=$(( now - last ))
+    else
+        elapsed=999999
+    fi
+    if (( pct >= RAM_FORCE_PCT )); then
+        echo "$now" > "$RAM_CLEAN_STATE"
+        res=$(do_ramclean)
+        echo "$(date '+%F %T') RAM=${pct}% >= ${RAM_FORCE_PCT}% (forçado): $(echo "$res" | tr '\n' ' ' | cut -c1-120)" >> "$RAM_CLEAN_LOG"
+    elif (( pct >= RAM_LIMIT_PCT && elapsed >= 600 )); then
+        echo "$now" > "$RAM_CLEAN_STATE"
+        res=$(do_ramclean)
+        echo "$(date '+%F %T') RAM=${pct}% >= ${RAM_LIMIT_PCT}%: $(echo "$res" | tr '\n' ' ' | cut -c1-120)" >> "$RAM_CLEAN_LOG"
+    fi
+}
