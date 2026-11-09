@@ -89,9 +89,9 @@ WantedBy=multi-user.target
 SVC
 
 # dispatcher (0.0.0.0:80)
-cat > /etc/systemd/system/hcr-dispatcher.service << EOF
+cat > /etc/systemd/system/vpnproxy-bhttp-80.service << EOF
 [Unit]
-Description=HCR/BHTTP/WebSocket dispatcher (port 80)
+Description=VPNManager BHTTP/HCR/WebSocket dispatcher port 80
 After=network.target hcr-server.service vpnproxy-bhttp-18083.service
 Wants=hcr-server.service vpnproxy-bhttp-18083.service
 [Service]
@@ -105,10 +105,9 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable hcr-server vpnproxy-bhttp-18083 hcr-dispatcher >/dev/null 2>&1 || true
-systemctl restart hcr-server vpnproxy-bhttp-18083 hcr-dispatcher
+systemctl enable hcr-server vpnproxy-bhttp-18083 vpnproxy-bhttp-80 >/dev/null 2>&1 || true
+systemctl restart hcr-server vpnproxy-bhttp-18083 vpnproxy-bhttp-80
 
 # desativa bhttp antigo na 80 se existir
-systemctl disable vpnproxy-bhttp-80 >/dev/null 2>&1 || true
-systemctl stop vpnproxy-bhttp-80 >/dev/null 2>&1 || true
+echo "port 80 stack active"
 echo "Stack port 80 (WebSocket/BHTTP/HCR) ativo."
