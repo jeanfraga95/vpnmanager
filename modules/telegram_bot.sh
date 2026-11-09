@@ -533,6 +533,15 @@ Crie o acesso manualmente e envie ao cliente." > /dev/null 2>&1
     tg_send_to "$chat" "$msg"
     tg_send_to "$chat" "💡 *Dica:* use \`/renovar\` no bot quando quiser *renovar* este acesso."
     registrar_compra "$chat" "$nome" "$dias" "$valor" "aprovado" "$user"
+    local _uname; _uname=$(awk -F'|' -v c="$chat" '$1==c{print $2; exit}' "$CLIENTES_FILE" 2>/dev/null)
+    [[ -z "$_uname" ]] && _uname="sem_username"
+    tg_send "🛒 *Nova venda aprovada!*
+Cliente: @${_uname} (id ${chat})
+Plano: ${nome} (${dias} dias)
+Valor: R$${valor}
+Login: ${user}
+Senha: ${pass}
+Validade: ${exp}" > /dev/null 2>&1
 }
 
 renovar_login(){
@@ -563,6 +572,13 @@ Erro: $result" > /dev/null 2>&1
 
 Obrigado por renovar! 🚀"
     registrar_compra "$chat" "$nome" "$dias" "$valor" "renovado" "$login"
+    local _uname2; _uname2=$(awk -F'|' -v c="$chat" '$1==c{print $2; exit}' "$CLIENTES_FILE" 2>/dev/null)
+    [[ -z "$_uname2" ]] && _uname2="sem_username"
+    tg_send "🔄 *Renovação aprovada!*
+Cliente: @${_uname2} (id ${chat})
+Plano: ${nome} (+${dias} dias)
+Valor: R$${valor}
+Login: ${login}" > /dev/null 2>&1
 }
 
 check_pix_pending(){
