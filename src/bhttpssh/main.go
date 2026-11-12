@@ -86,21 +86,21 @@ const (
 	// e recalculado a cada tick do reaper dividindo a RAM disponivel pelo
 	// numero de sessoes vivas — assim nenhum usuario sozinho consegue
 	// "encher" o servidor e derrubar os outros. Ver updateDynamicCaps().
-	dlSoftCapMax   = 152 << 20 // buffer p/ transfers pesados (speedtest 5.0.1 encostou em 64MB em 1s; folga maior evita backpressure precoce)
+	dlSoftCapMax   = 256 << 20 // buffer p/ transfers pesados (speedtest 5.0.1 encostou em 64MB em 1s; folga maior evita backpressure precoce)
 	dlSoftCapMin   = 12 << 20  // piso: abaixo disso um download normal ja engasga
 	// margem de reentrega: o trim NUNCA corta o dlBuf alem de deixar estes
 	// ultimos bytes vivos, para que ordinais re-puxados fora de ordem pelo
 	// app (speedtest multi-conexao) ainda tenham seu span reentregue em vez
 	// de virar vazio e encolher a janela (congelamento pos-speedtest).
 	// tambem escala com curDLCap() (ver curReplayRetain).
-	replayRetainMax = 32 << 20
+	replayRetainMax = 64 << 20
 	replayRetainMin = 2 << 20
 	idleSessionTTL  = 15 * time.Minute // zumbi (app sumiu sem fechar limpo) e liberado logo; ajustavel via --idle
 	connIdleTO     = 150 * time.Second
 	connWriteTO    = 30 * time.Second  // timeout de escrita no app (mobile CGNAT precisa de mais tempo)
 	chunkWait      = 300 * time.Millisecond
 	maxPendingUp   = 4096 // frames de upload fora de ordem (sanidade)
-	maxConnOutQ    = 16384 // slots na fila de resposta por conexao (app 5.0.0: 32 connections)
+	maxConnOutQ    = 32768 // slots na fila de resposta por conexao (app 5.0.0: 32 connections)
 )
 
 var (
@@ -1442,6 +1442,8 @@ func handleConn(c net.Conn, dest string, fallback string) {
 		tc.SetKeepAlive(true)
 		tc.SetKeepAlivePeriod(20 * time.Second)
 		tc.SetNoDelay(true)
+		_ = tc.SetReadBuffer(256 * 1024)
+		_ = tc.SetWriteBuffer(256 * 1024)
 	}
 	var sess *Session
 	var connKey [16]byte // chave DESSA conexao (pode diferir da sessao reatachada)
