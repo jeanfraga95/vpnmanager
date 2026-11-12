@@ -79,28 +79,28 @@ const (
 	hdrSize     = 29
 	respHdrSize = 5
 	maxPayload  = 160 * 1024 // probes chegam a 131072+29 (dk.c)
-	maxBatch       = 2048
+	maxBatch       = 1024
 	// dlSoftCapMax/dlSoftCapMin: teto e piso do buffer de download POR
 	// SESSAO. Com 1 usuario o servidor pode dar o teto inteiro (folga p/
 	// speedtest pesado); com N usuarios simultaneos o cap efetivo (curDLCap)
 	// e recalculado a cada tick do reaper dividindo a RAM disponivel pelo
 	// numero de sessoes vivas — assim nenhum usuario sozinho consegue
 	// "encher" o servidor e derrubar os outros. Ver updateDynamicCaps().
-	dlSoftCapMax   = 512 << 20 // buffer p/ transfers pesados (speedtest 5.0.1 encostou em 64MB em 1s; folga maior evita backpressure precoce)
+	dlSoftCapMax   = 152 << 20 // buffer p/ transfers pesados (speedtest 5.0.1 encostou em 64MB em 1s; folga maior evita backpressure precoce)
 	dlSoftCapMin   = 12 << 20  // piso: abaixo disso um download normal ja engasga
 	// margem de reentrega: o trim NUNCA corta o dlBuf alem de deixar estes
 	// ultimos bytes vivos, para que ordinais re-puxados fora de ordem pelo
 	// app (speedtest multi-conexao) ainda tenham seu span reentregue em vez
 	// de virar vazio e encolher a janela (congelamento pos-speedtest).
 	// tambem escala com curDLCap() (ver curReplayRetain).
-	replayRetainMax = 128 << 20
+	replayRetainMax = 32 << 20
 	replayRetainMin = 2 << 20
 	idleSessionTTL  = 15 * time.Minute // zumbi (app sumiu sem fechar limpo) e liberado logo; ajustavel via --idle
 	connIdleTO     = 150 * time.Second
-	connWriteTO    = 60 * time.Second  // timeout de escrita no app (mobile CGNAT precisa de mais tempo)
-	chunkWait      = 100 * time.Millisecond
-	maxPendingUp   = 8192 // frames de upload fora de ordem (sanidade)
-	maxConnOutQ    = 65536 // slots na fila de resposta por conexao (app 5.0.0: 32 connections)
+	connWriteTO    = 30 * time.Second  // timeout de escrita no app (mobile CGNAT precisa de mais tempo)
+	chunkWait      = 300 * time.Millisecond
+	maxPendingUp   = 4096 // frames de upload fora de ordem (sanidade)
+	maxConnOutQ    = 16384 // slots na fila de resposta por conexao (app 5.0.0: 32 connections)
 )
 
 var (
