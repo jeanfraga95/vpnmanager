@@ -80,7 +80,7 @@ Description=VPNManager BHTTP SSH tunnel port 18083 -> 127.0.0.1:2223
 After=network.target
 [Service]
 User=root
-ExecStart=$BHTTP_BIN --port 18083 --static-target 127.0.0.1:2223 --fallback-target 127.0.0.1:8080 --idle 1h --quic-port 80 --tls-cert $INSTALL_DIR/conf/bhttp_80_cert.pem --tls-key $INSTALL_DIR/conf/bhttp_80_key.pem
+ExecStart=$BHTTP_BIN --port 18083 --static-target 127.0.0.1:2223 --fallback-target 127.0.0.1:8080 --idle 2m --quic-port 80 --tls-cert $INSTALL_DIR/conf/bhttp_80_cert.pem --tls-key $INSTALL_DIR/conf/bhttp_80_key.pem
 Restart=always
 RestartSec=3
 LimitNOFILE=1000000
