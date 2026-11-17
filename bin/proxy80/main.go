@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"strings"
+	"time"
 )
 
 var (
@@ -15,46 +16,94 @@ var (
 	bhttpTarget = "127.0.0.1:18083"
 )
 
-func detectProtocol(r *bufio.Reader) (string, []byte) {
-	b, err := r.Peek(1)
+func detectProtocol(client net.Conn) (string, io.Reader, error) {
+	client.SetReadDeadline(time.Now().Add(3 * time.Second))
+	defer client.SetReadDeadline(time.Time{})
+
+	reader := bufio.NewReaderSize(client, 8192)
+
+	var peekBuf []byte
+
+	b, err := reader.Peek(1)
 	if err != nil {
-		return bhttpTarget, nil
-	}
-
-	if len(b) >= 1 && b[0] == 0x01 {
-		b2, _ := r.Peek(2)
-		if len(b2) >= 2 && b2[0] == 0x01 && b2[1] == 0x01 {
-			peekAll, _ := r.Peek(r.Buffered())
-			return hcrTarget, peekAll
+		buf := make([]byte, 1)
+		n, readErr := reader.Read(buf)
+		if readErr != nil || n == 0 {
+			return bhttpTarget, client, nil
 		}
+		b = buf[:n]
+		peekBuf = append(peekBuf, b...)
 	}
 
-	if len(b) >= 1 && b[0] == 0x16 {
-		peekAll, _ := r.Peek(r.Buffered())
-		return hcrTarget, peekAll
-	}
+	if len(b) >= 1 {
+		first := b[0]
 
-	peek, err := r.Peek(1024)
-	if err != nil && err != bufio.ErrBufferFull {
-		return bhttpTarget, nil
-	}
-
-	for _, method := range []string{"GET ", "POST ", "CONNECT ", "HEAD ", "OPTIONS ", "PUT ", "DELETE ", "PATCH "} {
-		if strings.HasPrefix(string(peek), method) {
-			lower := strings.ToLower(string(peek))
-			if strings.Contains(lower, "upgrade: websocket") {
-				return wsTarget, peek
+		// HCR plain: 0x01 0x01
+		if first == 0x01 {
+			b2, err2 := reader.Peek(2)
+			if err2 == nil && len(b2) >= 2 && b2[0] == 0x01 && b2[1] == 0x01 {
+				reader.Discard(2)
+				peekBuf = append(peekBuf, 0x01, 0x01)
+				rest, _ := reader.Peek(reader.Buffered())
+				if len(rest) > 0 {
+					peekBuf = append(peekBuf, rest...)
+					reader.Discard(len(rest))
+				}
+				return hcrTarget, io.MultiReader((*bytesReader)(&peekBuf), reader), nil
 			}
-			return xhttpTarget, peek
+			return bhttpTarget, io.MultiReader((*bytesReader)(&peekBuf), reader), nil
+		}
+
+		// HCR TLS: 0x16
+		if first == 0x16 {
+			rest, _ := reader.Peek(reader.Buffered())
+			if len(rest) > 0 {
+				peekBuf = append(peekBuf, rest...)
+				reader.Discard(len(rest))
+			}
+			return hcrTarget, io.MultiReader((*bytesReader)(&peekBuf), reader), nil
+		}
+
+		// HTTP: ler linha por linha
+		isHTTPMethod := false
+		for _, m := range []byte{'G', 'P', 'C', 'H', 'O', 'U', 'D'} {
+			if first == m {
+				isHTTPMethod = true
+				break
+			}
+		}
+
+		if isHTTPMethod {
+			var headers strings.Builder
+			isWebSocket := false
+			headers.WriteByte(first)
+			for {
+				line, err := reader.ReadString('\n')
+				headers.WriteString(line)
+				if err != nil {
+					break
+				}
+				if line == "\r\n" || line == "\n" {
+					break
+				}
+				if strings.Contains(strings.ToLower(headers.String()), "upgrade: websocket") {
+					isWebSocket = true
+				}
+			}
+			peekBuf = []byte(headers.String())
+			rest, _ := reader.Peek(reader.Buffered())
+			if len(rest) > 0 {
+				peekBuf = append(peekBuf, rest...)
+				reader.Discard(len(rest))
+			}
+			if isWebSocket {
+				return wsTarget, io.MultiReader((*bytesReader)(&peekBuf), reader), nil
+			}
+			return xhttpTarget, io.MultiReader((*bytesReader)(&peekBuf), reader), nil
 		}
 	}
 
-	return bhttpTarget, peek
-}
-
-func copyConn(dst io.Writer, src io.Reader, done chan<- error) {
-	_, err := io.Copy(dst, src)
-	done <- err
+	return bhttpTarget, io.MultiReader((*bytesReader)(&peekBuf), reader), nil
 }
 
 type bytesReader []byte
@@ -68,11 +117,20 @@ func (b *bytesReader) Read(p []byte) (int, error) {
 	return n, nil
 }
 
+func copyConn(dst io.Writer, src io.Reader, done chan<- error) {
+	_, err := io.Copy(dst, src)
+	done <- err
+}
+
 func handleConn(client net.Conn) {
 	defer client.Close()
 
-	reader := bufio.NewReaderSize(client, 4096)
-	target, peekData := detectProtocol(reader)
+	target, src, err := detectProtocol(client)
+	if err != nil {
+		log.Printf("proxy80: erro detecao protocolo %s: %v", client.RemoteAddr(), err)
+		target = bhttpTarget
+		src = client
+	}
 
 	targetConn, err := net.Dial("tcp", target)
 	if err != nil {
@@ -82,11 +140,6 @@ func handleConn(client net.Conn) {
 	defer targetConn.Close()
 
 	log.Printf("proxy80: cliente %s -> %s", client.RemoteAddr(), target)
-
-	var src io.Reader = client
-	if len(peekData) > 0 {
-		src = io.MultiReader((*bytesReader)(&peekData), client)
-	}
 
 	done := make(chan error, 2)
 	go copyConn(targetConn, src, done)
