@@ -1,13 +1,13 @@
 #!/bin/bash
 #============================================================
-# port80_stack.sh - Garante BHTTP + WebSocket + HCR na porta 80
+# port80_stack.sh - Garante BHTTP + WebSocket + HCR + XHTTP na porta 80
 #============================================================
 set -e
 
 INSTALL_DIR="/etc/VPNManager"
 BHTTP_BIN="$INSTALL_DIR/bin/bhttpssh_dtp"
 HCR_BIN="/usr/local/bin/hcr-server"
-DISP_BIN="/usr/local/bin/hcr-dispatcher"
+PROXY80_BIN="$INSTALL_DIR/bin/proxy80/proxy80"
 
 mkdir -p "$INSTALL_DIR/conf" "$INSTALL_DIR/bin"
 
@@ -18,6 +18,15 @@ if [[ ! -f "$INSTALL_DIR/conf/hcr_80_cert.pem" || ! -f "$INSTALL_DIR/conf/hcr_80
         -subj "/CN=hcr" >/dev/null 2>&1
     chmod 600 "$INSTALL_DIR/conf/hcr_80_key.pem"
     chmod 644 "$INSTALL_DIR/conf/hcr_80_cert.pem"
+fi
+
+# Certificado BHTTP (TLS auto para QUIC)
+if [[ ! -f "$INSTALL_DIR/conf/bhttp_80_cert.pem" || ! -f "$INSTALL_DIR/conf/bhttp_80_key.pem" ]]; then
+    openssl req -x509 -newkey rsa:2048 -keyout "$INSTALL_DIR/conf/bhttp_80_key.pem" \
+        -out "$INSTALL_DIR/conf/bhttp_80_cert.pem" -days 3650 -nodes \
+        -subj "/CN=bhttp" >/dev/null 2>&1
+    chmod 600 "$INSTALL_DIR/conf/bhttp_80_key.pem"
+    chmod 644 "$INSTALL_DIR/conf/bhttp_80_cert.pem"
 fi
 
 # sshd-bhttp (2223)
@@ -76,7 +85,7 @@ EOF
 # bhttp backend (18083)
 cat > /etc/systemd/system/vpnproxy-bhttp-18083.service << SVC
 [Unit]
-Description=VPNManager BHTTP SSH tunnel port 18083 -> 127.0.0.1:2223
+Description=VPNManager BHTTP SSH tunnel port 18083 -> 127.0.0.1:2223 (QUIC enabled)
 After=network.target
 [Service]
 User=root
@@ -88,15 +97,23 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 SVC
 
-# dispatcher (0.0.0.0:80)
-cat > /etc/systemd/system/vpnproxy-bhttp-80.service << EOF
+# dispatcher antigo (porta 80) - desativado, substituido por proxy80
+if [[ -f /etc/systemd/system/vpnproxy-bhttp-80.service ]]; then
+    systemctl stop vpnproxy-bhttp-80 >/dev/null 2>&1 || true
+    systemctl disable vpnproxy-bhttp-80 >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/vpnproxy-bhttp-80.service
+    systemctl daemon-reload
+fi
+
+# proxy80 (0.0.0.0:80) - HCR + WebSocket + XHTTP + BHTTP
+cat > /etc/systemd/system/vpnproxy-port80.service << EOF
 [Unit]
-Description=VPNManager BHTTP/HCR/WebSocket dispatcher port 80
-After=network.target hcr-server.service vpnproxy-bhttp-18083.service
-Wants=hcr-server.service vpnproxy-bhttp-18083.service
+Description=VPNManager Port 80 Proxy (HCR + WebSocket + XHTTP + BHTTP)
+After=network.target hcr-server.service vpnproxy-bhttp-18083.service vpnproxy-xhttp-10443.service
+Wants=hcr-server.service vpnproxy-bhttp-18083.service vpnproxy-xhttp-10443.service
 [Service]
 Type=simple
-ExecStart=$DISP_BIN --listen 0.0.0.0:80 --hcr-target 127.0.0.1:18082 --ws-target 127.0.0.1:8080 --bhttp-target 127.0.0.1:18083
+ExecStart=$PROXY80_BIN
 Restart=always
 RestartSec=2s
 LimitNOFILE=1000000
@@ -105,9 +122,12 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable hcr-server vpnproxy-bhttp-18083 vpnproxy-bhttp-80 >/dev/null 2>&1 || true
-systemctl restart hcr-server vpnproxy-bhttp-18083 vpnproxy-bhttp-80
+systemctl enable hcr-server vpnproxy-bhttp-18083 vpnproxy-port80 >/dev/null 2>&1 || true
+systemctl restart hcr-server vpnproxy-bhttp-18083 vpnproxy-port80
 
-# desativa bhttp antigo na 80 se existir
+# garantir que o xhttp esteja ativo (porta 10443)
+systemctl enable vpnproxy-xhttp-10443 >/dev/null 2>&1 || true
+systemctl start vpnproxy-xhttp-10443 >/dev/null 2>&1 || true
+
 echo "port 80 stack active"
-echo "Stack port 80 (WebSocket/BHTTP/HCR) ativo."
+echo "Stack port 80 (WebSocket/BHTTP/HCR/XHTTP) ativo via proxy80."

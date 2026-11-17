@@ -159,9 +159,9 @@ bhttp_open_port(){
 
     if [[ "$porta" == "80" ]]; then
         echo
-        echo " Configurando stack completa na porta 80 (WebSocket/BHTTP/HCR)..."
+        echo " Configurando stack completa na porta 80 (WebSocket/BHTTP/HCR/XHTTP)..."
         bash "$INSTALL_DIR/modules/port80_stack.sh"
-        ok "Porta 80 ativa: WebSocket/BHTTP/HCR"
+        ok "Porta 80 ativa: WebSocket/BHTTP/HCR/XHTTP"
         pause
         return
     fi

@@ -79,28 +79,28 @@ const (
 	hdrSize     = 29
 	respHdrSize = 5
 	maxPayload  = 160 * 1024 // probes chegam a 131072+29 (dk.c)
-	maxBatch       = 1024
+	maxBatch       = 2048
 	// dlSoftCapMax/dlSoftCapMin: teto e piso do buffer de download POR
 	// SESSAO. Com 1 usuario o servidor pode dar o teto inteiro (folga p/
 	// speedtest pesado); com N usuarios simultaneos o cap efetivo (curDLCap)
 	// e recalculado a cada tick do reaper dividindo a RAM disponivel pelo
 	// numero de sessoes vivas — assim nenhum usuario sozinho consegue
 	// "encher" o servidor e derrubar os outros. Ver updateDynamicCaps().
-	dlSoftCapMax   = 152 << 20 // buffer p/ transfers pesados (speedtest 5.0.1 encostou em 64MB em 1s; folga maior evita backpressure precoce)
+	dlSoftCapMax   = 256 << 20 // buffer p/ transfers pesados (speedtest 5.0.1 encostou em 64MB em 1s; folga maior evita backpressure precoce)
 	dlSoftCapMin   = 12 << 20  // piso: abaixo disso um download normal ja engasga
 	// margem de reentrega: o trim NUNCA corta o dlBuf alem de deixar estes
 	// ultimos bytes vivos, para que ordinais re-puxados fora de ordem pelo
 	// app (speedtest multi-conexao) ainda tenham seu span reentregue em vez
 	// de virar vazio e encolher a janela (congelamento pos-speedtest).
 	// tambem escala com curDLCap() (ver curReplayRetain).
-	replayRetainMax = 32 << 20
+	replayRetainMax = 256 << 20
 	replayRetainMin = 2 << 20
 	idleSessionTTL  = 15 * time.Minute // zumbi (app sumiu sem fechar limpo) e liberado logo; ajustavel via --idle
-	connIdleTO     = 150 * time.Second
+	connIdleTO     = 600 * time.Second
 	connWriteTO    = 30 * time.Second  // timeout de escrita no app (mobile CGNAT precisa de mais tempo)
-	chunkWait      = 300 * time.Millisecond
-	maxPendingUp   = 4096 // frames de upload fora de ordem (sanidade)
-	maxConnOutQ    = 16384 // slots na fila de resposta por conexao (app 5.0.0: 32 connections)
+	chunkWait      = 500 * time.Millisecond
+	maxPendingUp   = 8192 // frames de upload fora de ordem (sanidade)
+	maxConnOutQ    = 32768 // slots na fila de resposta por conexao (app 5.0.0: 32 connections)
 )
 
 var (
@@ -155,7 +155,7 @@ func updateDynamicCaps(ram ramInfo, nSessions int) {
 	}
 	// reserva 50% da RAM disponivel pro conjunto de buffers de download;
 	// o resto fica pra SO, goroutines, outros buffers do processo etc.
-	budget := int64(float64(ram.Available) * 0.5)
+	budget := int64(float64(ram.Available) * 0.8)
 	per := budget / int64(nSessions)
 	if per > dlSoftCapMax {
 		per = dlSoftCapMax
@@ -163,7 +163,7 @@ func updateDynamicCaps(ram ramInfo, nSessions int) {
 	if per < dlSoftCapMin {
 		per = dlSoftCapMin
 	}
-	retain := per / 4
+	retain := per / 2
 	if retain > replayRetainMax {
 		retain = replayRetainMax
 	}
@@ -643,6 +643,13 @@ func (s *Session) ensureSSH() bool {
 		return false
 	}
 	s.ssh = conn
+	if tc, ok := conn.(*net.TCPConn); ok {
+		tc.SetNoDelay(true)
+		_ = tc.SetReadBuffer(256 * 1024)
+		_ = tc.SetWriteBuffer(256 * 1024)
+		tc.SetKeepAlive(true)
+		tc.SetKeepAlivePeriod(20 * time.Second)
+	}
 	d := make(chan struct{})
 	s.upDone = d
 	s.cond.Broadcast()
@@ -878,14 +885,7 @@ if ref, ok := s.served[k]; ok {
 			// served[k] (nao foi trimmado) e estiver DENTRO da janela ja
 			// carregada, REENTREGAMOS em vez de vazio — o app recebe os bytes
 			// que esperava sem corromper o stream (bytes ja emitidos sob k).
-			if ref, still := s.served[k]; still &&
-				ref.start >= s.dlBase && ref.end <= s.dlBase+int64(len(s.dlBuf)) {
-				s.dlReplayCount++
-				out := make([]byte, ref.end-ref.start)
-				copy(out, s.dlBuf[ref.start-s.dlBase:ref.end-s.dlBase])
-				vlog("getChunk(%d,%d) -> obsoleto reentregue %dB (window)", k, reqSize, len(out))
-				return out, 0, false
-			}
+			// NAO reentregar chunks obsoletos — evita desync e packet corrupt
 			s.dlObsoleteCnt++
 			s.obsGap += s.nextIdx - k
 			s.obsGapN++
@@ -923,7 +923,7 @@ if ref, ok := s.served[k]; ok {
 			// detinha minK morreu, sem timeout travaria TODOS os downloads
 			// desta sessao para sempre (sshd enche, app nunca expande a
 			// janela SSH → speedtest de upload engasga/congela).
-			if time.Since(waitStart) > 3*time.Second {
+			if time.Since(waitStart) > 1*time.Second {
 				delete(s.dlPending, k)
 				s.dlBailCount++
 				s.cond.Broadcast()
@@ -1820,8 +1820,8 @@ func reaper() {
 				stale = append(stale, s)
 			}
 			if !s.firstPendAt.IsZero() && s.bannerBy != nil &&
-				time.Since(s.firstPendAt) > 2*time.Second &&
-				time.Since(s.lastUpWrite) > 2*time.Second {
+				time.Since(s.firstPendAt) > 10*time.Second &&
+				time.Since(s.lastUpWrite) > 10*time.Second {
 				gapStuck = append(gapStuck, s)
 			}
 			// deteccao de CONGELAMENTO de download: o app encolheu a janela
@@ -1834,8 +1834,8 @@ func reaper() {
 			// um speedtest que apenas esta na fase de upload).
 			if !s.dead && s.everData && !s.lastDLAdvance.IsZero() &&
 				(s.dlOutBytes > 0 || len(s.dlBuf) > 0) &&
-				time.Since(s.lastDLAdvance) >= 8*time.Second &&
-				(s.lastUpWrite.IsZero() || time.Since(s.lastUpWrite) >= 8*time.Second) {
+				time.Since(s.lastDLAdvance) >= 30*time.Second &&
+				(s.lastUpWrite.IsZero() || time.Since(s.lastUpWrite) >= 30*time.Second) {
 				dlFrozen = append(dlFrozen, s)
 			}
 			if !s.dead && len(s.served) > 0 && len(s.dlBuf) > 0 {
@@ -2033,10 +2033,14 @@ func main() {
 	if *flagQUICPort > 0 {
 		quicAddr := fmt.Sprintf(":%d", *flagQUICPort)
 		quicLn, err := quic.ListenAddr(quicAddr, tlsServer, &quic.Config{
-			MaxIdleTimeout:        300 * time.Second,
-			KeepAlivePeriod:       30 * time.Second,
-			MaxIncomingStreams:     100,
-			MaxIncomingUniStreams:  0,
+			MaxIdleTimeout:               300 * time.Second,
+			KeepAlivePeriod:              30 * time.Second,
+			MaxIncomingStreams:           1000,
+			MaxIncomingUniStreams:        100,
+			InitialStreamReceiveWindow:    1 << 20,
+			MaxStreamReceiveWindow:        16 << 20,
+			InitialConnectionReceiveWindow: 1 << 20,
+			MaxConnectionReceiveWindow:    16 << 20,
 		})
 		if err != nil {
 			log.Fatalf("QUIC: erro escutando em %s: %v", quicAddr, err)
