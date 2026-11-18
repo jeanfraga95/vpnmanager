@@ -1488,6 +1488,13 @@ func handleConn(c net.Conn, dest string, fallback string) {
 			sessForDrop = sess
 		}
 		sess.touch()
+		// Conectar ao SSH no primeiro frame (handshake inicial) para evitar deadlock:
+		// o app espera o banner SSH antes de enviar upload/download.
+		if typ == frameProbe && seq == 0 {
+			if !sess.ensureSSH() {
+				log.Printf("sessao %x: falha ao conectar SSH no handshake inicial", sess.key[:4])
+			}
+		}
 		if *flagVerbose {
 		vlog("frame tipo=%d seq=%d plen=%d", typ, seq, plen)
 	}
