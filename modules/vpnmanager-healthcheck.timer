@@ -1,0 +1,11 @@
+[Unit]
+Description=VPNManager Health Check Timer (a cada 2 minutos)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=10s
+Unit=vpnmanager-healthcheck.service
+
+[Install]
+WantedBy=timers.target

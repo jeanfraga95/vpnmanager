@@ -1,0 +1,8 @@
+*.bak
+*.bak_*
+*.orig
+*.rej
+*.tmp
+*.running
+__pycache__/
+*.pyc

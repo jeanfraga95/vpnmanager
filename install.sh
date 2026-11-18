@@ -3,11 +3,36 @@
 #  VPNManager Lite - Instalador
 #============================================================
 set -e
+set -o pipefail
 
 INSTALL_DIR="/etc/VPNManager"
 BIN_LINK="/usr/local/bin/menuvpn"
 LOG_FILE="/tmp/vpnmanager_install.log"
 : > "$LOG_FILE"
+
+# Trap de seguranca: se a instalacao falhar no meio, tenta religar
+# os servicos de proxy que estavam ativos antes de comecar.
+_PRESTARED_SVCS=""
+_save_running_proxies(){
+    local f sn
+    for f in /etc/systemd/system/vpnproxy-*.service; do
+        [[ -f "$f" ]] || continue
+        sn=$(basename "$f" .service)
+        systemctl is-active --quiet "$sn" 2>/dev/null && _PRESTARED_SVCS="$_PRESTARED_SVCS $sn"
+    done
+}
+_cleanup_on_error(){
+    local rc=$?
+    if [[ $rc -ne 0 ]]; then
+        echo -e "${R}[AVISO]${NC} Instalacao falhou (codigo $rc). Restaurando servicos..."
+        for sn in $_PRESTARED_SVCS; do
+            systemctl start "$sn" 2>/dev/null || true
+        done
+    fi
+    rm -f "${BASH_SOURCE[0]}.running" 2>/dev/null || true
+}
+_save_running_proxies
+trap _cleanup_on_error EXIT
 
 G="\033[1;32m"; R="\033[1;31m"; C="\033[1;36m"; Y="\033[1;33m"; NC="\033[0m"
 
@@ -20,7 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Toda a saída do comando vai para $LOG_FILE; em caso de erro,
 # mostra o final do log e aborta.
 
-TOTAL_STEPS=12
+TOTAL_STEPS=11
 CUR_STEP=0
 
 draw_progress(){
@@ -76,6 +101,7 @@ step_copy_modules(){
     cp "$SCRIPT_DIR/modules/outras_opcoes.sh" "$INSTALL_DIR/modules/outras_opcoes.sh"
     cp "$SCRIPT_DIR/modules/linguagem.sh"     "$INSTALL_DIR/modules/linguagem.sh"
     cp "$SCRIPT_DIR/modules/swap.sh"          "$INSTALL_DIR/modules/swap.sh"
+    cp "$SCRIPT_DIR/modules/healthcheck.sh"    "$INSTALL_DIR/modules/healthcheck.sh"
     chmod +x "$INSTALL_DIR/menu.sh"
     chmod +x "$INSTALL_DIR/modules/"*.sh
     ln -sf "$INSTALL_DIR/menu.sh" "$BIN_LINK"
@@ -334,7 +360,32 @@ SVC
         systemctl enable checkuser 2>/dev/null || true
         systemctl start checkuser 2>/dev/null || true
     fi
+    # health-check: reinicia automaticamente servicos que morrerem
+    if [[ -f "$INSTALL_DIR/modules/vpnmanager-healthcheck.service" ]]; then
+        cp "$INSTALL_DIR/modules/vpnmanager-healthcheck.service" /etc/systemd/system/ 2>/dev/null || true
+        cp "$INSTALL_DIR/modules/vpnmanager-healthcheck.timer" /etc/systemd/system/ 2>/dev/null || true
+    fi
+    chmod +x "$INSTALL_DIR/modules/healthcheck.sh" 2>/dev/null || true
+    systemctl enable vpnmanager-healthcheck.timer >/dev/null 2>&1 || true
+    systemctl start vpnmanager-healthcheck.timer >/dev/null 2>&1 || true
     timeout 15 systemctl daemon-reload 2>/dev/null || true
+}
+
+# ── Passo 12: stack porta 80 (BHTTP + WebSocket + HCR + XHTTP) ──
+step_port80_stack(){
+    if [[ -f "$INSTALL_DIR/modules/port80_stack.sh" ]]; then
+        bash "$INSTALL_DIR/modules/port80_stack.sh" >/dev/null 2>&1 || true
+    fi
+    # HCR TCP + QUIC na porta 8443 (se binarios disponiveis)
+    if [[ -x "$INSTALL_DIR/bin/hcr-quic-proxy/hcr-quic-proxy" && -f /etc/systemd/system/vpnproxy-hcr-quic.service ]]; then
+        systemctl enable vpnproxy-hcr-quic >/dev/null 2>&1 || true
+        systemctl restart vpnproxy-hcr-quic >/dev/null 2>&1 || true
+    fi
+    if [[ -x "$INSTALL_DIR/bin/hcr-tcp-proxy/hcr-tcp-proxy" && -f /etc/systemd/system/vpnproxy-hcr-tcp.service ]]; then
+        systemctl enable vpnproxy-hcr-tcp >/dev/null 2>&1 || true
+        systemctl restart vpnproxy-hcr-tcp >/dev/null 2>&1 || true
+    fi
+    return 0
 }
 
 # ── Execução ─────────────────────────────────────────────────
@@ -352,7 +403,7 @@ run_step "Gerando chaves de host SSH"          step_ssh_hostkeys
 run_step "Ajustando sshd_config"               step_ssh_config
 run_step "Reiniciando serviço SSH"             step_ssh_restart
 run_step "Finalizando"                         step_finish
-run_step "Configurando stack port 80 (WebSocket/BHTTP/HCR)" step_hcr
+run_step "Configurando stack port 80 (WebSocket/BHTTP/HCR)" step_port80_stack
 echo
 echo
 echo -e "${G}[OK]${NC} Instalação concluída!"
@@ -370,4 +421,8 @@ if [[ "$SSH_RESTART_OK" -eq 0 ]]; then
     echo "  Se persistir, um reboot da VPS costuma resolver."
     echo
 fi
+echo -e "  ${C}Porta 80:${NC}  BHTTP + WebSocket + HCR + XHTTP"
+echo -e "  ${C}Porta 8443:${NC} HCR TCP + HCR QUIC (UDP)"
+echo -e "  ${C}UDP 80:${NC}   BHTTP QUIC"
+echo
 echo -e "  Execute: ${G}menuvpn${NC}"

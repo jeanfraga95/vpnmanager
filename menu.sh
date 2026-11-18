@@ -19,6 +19,7 @@ source "$INSTALL_DIR/modules/limiter.sh"
 source "$INSTALL_DIR/modules/banner.sh"
 source "$INSTALL_DIR/modules/bhttp.sh"
 source "$INSTALL_DIR/modules/outras_opcoes.sh"
+source "$INSTALL_DIR/modules/swap.sh"
 
 _lang_load
 

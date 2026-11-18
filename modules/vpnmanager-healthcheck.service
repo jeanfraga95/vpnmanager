@@ -1,0 +1,7 @@
+[Unit]
+Description=VPNManager Health Check (reinicia servicos mortos)
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/etc/VPNManager/modules/healthcheck.sh

@@ -33,7 +33,10 @@ get_ip(){
         fi
     fi
     local ip
-    ip=$(curl -s -4 --max-time 2 ifconfig.me 2>/dev/null)
+    if command -v curl >/dev/null 2>&1; then
+        ip=$(curl -s -4 --max-time 2 https://api.ipify.org 2>/dev/null)
+        [[ -z "$ip" ]] && ip=$(curl -s -4 --max-time 2 https://ifconfig.me 2>/dev/null)
+    fi
     [[ -z "$ip" ]] && ip=$(hostname -I 2>/dev/null | awk '{print $1}')
     [[ -z "$ip" ]] && ip="N/D"
     echo "$ip" > "$cache" 2>/dev/null
@@ -48,16 +51,26 @@ date_add_days(){
     date -d "+$1 days" "+%Y-%m-%d"
 }
 
+audit_log(){
+    local action="$1" detail="${2:-}"
+    local log="/var/log/vpnmanager_actions.log"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') | ${USER:-root} | $action | $detail" >> "$log" 2>/dev/null || true
+}
+
 conf_get(){
     [[ -f "$CONF" ]] && grep "^$1=" "$CONF" | cut -d'=' -f2-
 }
 
 conf_set(){
     local key="$1" val="$2"
+    local lock="${CONF}.lock"
+    exec 9>"$lock"
+    flock -x 9
     touch "$CONF"
     if grep -q "^$key=" "$CONF" 2>/dev/null; then
         sed -i "s|^$key=.*|$key=$val|" "$CONF"
     else
         echo "$key=$val" >> "$CONF"
     fi
+    flock -u 9
 }
