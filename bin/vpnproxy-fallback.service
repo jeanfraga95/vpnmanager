@@ -1,0 +1,14 @@
+[Unit]
+Description=VPNManager Fallback Proxy (HCR + WebSocket + XHTTP on port 19080)
+After=network.target hcr-server.service vpnproxy-xhttp-10443.service
+Wants=hcr-server.service vpnproxy-xhttp-10443.service
+
+[Service]
+Type=simple
+ExecStart=/etc/VPNManager/bin/fallback-proxy/fallback-proxy
+Restart=always
+RestartSec=2s
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target

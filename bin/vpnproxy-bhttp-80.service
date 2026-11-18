@@ -1,0 +1,14 @@
+[Unit]
+Description=VPNManager BHTTP SSH tunnel port 80 -> 127.0.0.1:2223 (QUIC enabled, fallback to HCR/WS/XHTTP)
+After=network.target sshd-bhttp.service vpnproxy-fallback.service
+Wants=sshd-bhttp.service vpnproxy-fallback.service
+
+[Service]
+User=root
+ExecStart=/etc/VPNManager/bin/bhttpssh_dtp --port 80 --static-target 127.0.0.1:2223 --fallback-target 127.0.0.1:19080 --idle 5m --quic-port 80 --tls-cert /etc/VPNManager/conf/bhttp_80_cert.pem --tls-key /etc/VPNManager/conf/bhttp_80_key.pem
+Restart=always
+RestartSec=3
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
