@@ -1,0 +1,14 @@
+[Unit]
+Description=VPNManager HCR QUIC Proxy (UDP 8443 -> TCP 18082)
+After=network.target hcr-server.service
+Wants=hcr-server.service
+
+[Service]
+Type=simple
+ExecStart=/etc/VPNManager/bin/hcr-quic-proxy/hcr-quic-proxy
+Restart=always
+RestartSec=2s
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target

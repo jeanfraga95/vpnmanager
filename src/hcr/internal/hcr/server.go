@@ -79,28 +79,28 @@ func NewServer(config Config) (*Server, error) {
 		return nil, errors.New("HCR TLS configuration is required for tls/auto transport")
 	}
 	if config.SessionTimeout <= 0 {
-		config.SessionTimeout = 2 * time.Minute
+		config.SessionTimeout = 5 * time.Minute
 	}
 	if config.DownloadPollTimeout <= 0 {
-		config.DownloadPollTimeout = 8 * time.Second
+		config.DownloadPollTimeout = 15 * time.Second
 	}
 	if config.MaxDownloadFrame <= 0 {
-		config.MaxDownloadFrame = 6144
+		config.MaxDownloadFrame = 65536
 	}
 	if config.MaxDownloadFrame > MaxPayloadSize-4 {
 		return nil, errors.New("HCR max download frame exceeds protocol limit")
 	}
 	if config.MaxReplayBytes <= 0 {
-		config.MaxReplayBytes = 256 * 1024 * 1024
+		config.MaxReplayBytes = 512 * 1024 * 1024
 	}
 	if config.MaxConnections <= 0 {
-		config.MaxConnections = 2048
+		config.MaxConnections = 8192
 	}
 	if config.MaxSessions <= 0 {
-		config.MaxSessions = 32
+		config.MaxSessions = 128
 	}
 	if config.MaxSessionsPerIP <= 0 {
-		if 16 < config.MaxSessions { config.MaxSessionsPerIP = 16 } else { config.MaxSessionsPerIP = config.MaxSessions }
+		if 64 < config.MaxSessions { config.MaxSessionsPerIP = 64 } else { config.MaxSessionsPerIP = config.MaxSessions }
 	}
 	return &Server{config: config, sessions: make(map[SessionID]*session), closed: make(chan struct{}), connections: make(chan struct{}, config.MaxConnections)}, nil
 }
@@ -142,6 +142,8 @@ func tuneConn(conn net.Conn) {
 		_ = tcp.SetNoDelay(true)
 		_ = tcp.SetReadBuffer(256 * 1024)
 		_ = tcp.SetWriteBuffer(256 * 1024)
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(15 * time.Second)
 	}
 }
 
