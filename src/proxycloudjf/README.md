@@ -31,6 +31,8 @@ protocolo ou por flags opcionais.
 - **Token opcional**: desligado por padrão. Quando ativo, aceita
   `X-Auth-Token`, `Authorization: Bearer`, `?token=` (WS/HTTP) e USERID (SOCKS).
 - **TCP keepalive**: 60s idle / 30s interval / 3 retries (não injeta dados).
+- **Timeout ocioso**: 10s esperando o magic, igual ao proxy original (o 101 é
+  enviado após 1s sem dados do cliente).
 
 ## Flags
 

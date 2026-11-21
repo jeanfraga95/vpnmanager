@@ -60,6 +60,7 @@ typedef struct {
     conn_state_t state;
     bool connected_to_remote;
     bool freed;
+    struct event *magic_timer;   // timeout explícito (libevent não rearma sozinho)
     int frag_in;
     int frag_out;
     // buffers auxiliares
@@ -82,9 +83,26 @@ void accept_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
 static void free_proxy_ctx(proxy_ctx_t *ctx) {
     if (!ctx || ctx->freed) return;
     ctx->freed = true;
+    if (ctx->magic_timer) { event_free(ctx->magic_timer); ctx->magic_timer = NULL; }
     if (ctx->client) bufferevent_free(ctx->client);
     if (ctx->remote) bufferevent_free(ctx->remote);
     free(ctx);
+}
+
+static void clear_magic_timer(proxy_ctx_t *ctx) {
+    if (ctx && ctx->magic_timer) {
+        event_free(ctx->magic_timer);
+        ctx->magic_timer = NULL;
+    }
+}
+
+// Fecha conexões que ficaram ociosas esperando o magic (10s, como o original)
+static void magic_timeout_cb(evutil_socket_t fd, short what, void *arg) {
+    proxy_ctx_t *ctx = arg;
+    (void)fd; (void)what;
+    if (!ctx || ctx->freed) return;
+    if (ctx->state == ST_WS_MAGIC && !ctx->connected_to_remote)
+        free_proxy_ctx(ctx);
 }
 
 // --- DPI: primeiros bytes em pedaços pequenos com delay ---
@@ -144,8 +162,15 @@ static void set_nodelay(struct bufferevent *bev) {
 }
 
 static void set_magic_timeouts(proxy_ctx_t *ctx) {
-    struct timeval tv = {30, 0};
-    if (ctx && ctx->client) bufferevent_set_timeouts(ctx->client, &tv, &tv);
+    // Mantém o timeout de 10s do proxy original para conexões ociosas.
+    // Usamos um timer de evento explícito: o timeout do bufferevent não rearma
+    // depois de disparar, o que deixava a conexão pendurada para sempre.
+    if (!ctx || !ctx->client) return;
+    clear_magic_timer(ctx);
+    ctx->magic_timer = evtimer_new(base, magic_timeout_cb, ctx);
+    struct timeval tv = {10, 0};
+    if (ctx->magic_timer) evtimer_add(ctx->magic_timer, &tv);
+    bufferevent_set_timeouts(ctx->client, NULL, NULL);
 }
 
 // --- utilitários HTTP / cripto ---
@@ -367,6 +392,7 @@ static bool connect_relay(proxy_ctx_t *ctx, const char *host, uint16_t port) {
         addr.sin_addr.s_addr = inet_addr("127.0.0.1");
 
     ctx->connected_to_remote = true;
+    clear_magic_timer(ctx);
     bufferevent_set_timeouts(ctx->client, NULL, NULL);
     ctx->remote = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
     if (!ctx->remote) { free_proxy_ctx(ctx); return false; }
