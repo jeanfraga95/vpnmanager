@@ -31,8 +31,12 @@ protocolo ou por flags opcionais.
 - **Token opcional**: desligado por padrão. Quando ativo, aceita
   `X-Auth-Token`, `Authorization: Bearer`, `?token=` (WS/HTTP) e USERID (SOCKS).
 - **TCP keepalive**: 60s idle / 30s interval / 3 retries (não injeta dados).
-- **Timeout ocioso**: 10s esperando o magic, igual ao proxy original (o 101 é
-  enviado após 1s sem dados do cliente).
+- **101 imediato para o app**: se o cliente silenciar por 50ms no aceite, o
+  proxy envia o `101 OK` exato do original e passa a esperar o magic. Isso é
+  necessário porque o app CloudJF espera o 101 antes de enviar qualquer dado.
+  Se o cliente falar primeiro (SOCKS, probe, WS real), o protocolo é detectado
+  normalmente e o 101 não é enviado antecipadamente.
+- **Timeout ocioso**: 10s esperando o magic, igual ao proxy original.
 
 ## Flags
 
@@ -42,6 +46,7 @@ protocolo ou por flags opcionais.
 --response TEXTO         texto da resposta legada (padrão OK)
 --no-dpi                 desliga fragmentação anti-DPI
 --legacy-101             resposta 101 original exata
+--no-immediate-101       não envia 101 no aceite (exige GET WebSocket)
 --socks-force-local      ignora destino SOCKS/CONNECT e usa 127.0.0.1:<to>
 --no-keepalive           desliga TCP keepalive
 --tls-target HOST:PORT   destino do ClientHello (padrão 127.0.0.1:443)
@@ -57,6 +62,7 @@ protocolo ou por flags opcionais.
 - `--legacy-101` — volta à resposta `101 OK` exata
 - `--no-dpi` — desliga a fragmentação
 - `--no-keepalive` — desliga keepalive
+- `--no-immediate-101` — volta ao handshake WS estrito (espera o GET)
 
 Para voltar ao binário anterior: `/etc/VPNManager/bin/proxy.bak_pre_dpi`.
 

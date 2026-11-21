@@ -33,6 +33,9 @@ int DPI_CHUNK = 8;
 int DPI_DELAY_MS = 12;
 
 // Novos recursos
+// 101 imediato no aceite (comportamento do proxy original). O app CloudJF
+// espera o 101 sem enviar nada antes; desativar com --no-immediate-101.
+bool IMMEDIATE_101 = true;
 bool KEEPALIVE = true;
 char TLS_TARGET_HOST[256] = "127.0.0.1";
 int TLS_TARGET_PORT = 443;
@@ -60,6 +63,7 @@ typedef struct {
     conn_state_t state;
     bool connected_to_remote;
     bool freed;
+    bool sent_101;               // evita responder 101 duas vezes na mesma conexão
     struct event *magic_timer;   // timeout explícito (libevent não rearma sozinho)
     int frag_in;
     int frag_out;
@@ -196,10 +200,31 @@ static void make_ws_accept(const char *key, char *out, size_t outlen) {
     out[j] = '\0';
 }
 
+// O app CloudJF envia cabeçalhos com \n (LF), não \r\n (CRLF).
+// Retorna a posição do fim e o tamanho do terminador encontrado.
+static size_t find_header_end(struct evbuffer *input, struct evbuffer_ptr *out) {
+    size_t len = evbuffer_get_length(input);
+    out->pos = -1;
+    if (len == 0 || len > MAXBUF) return 0;
+    unsigned char *d = evbuffer_pullup(input, len);
+    if (!d) return 0;
+    static const unsigned char crlf2[4] = {'\r','\n','\r','\n'};
+    static const unsigned char lfcrlf[3] = {'\n','\r','\n'};
+    static const unsigned char lf2[2] = {'\n','\n'};
+    for (size_t i = 0; i + 4 <= len; i++)
+        if (memcmp(d + i, crlf2, 4) == 0) { out->pos = (ev_ssize_t)i; return 4; }
+    for (size_t i = 0; i + 3 <= len; i++)
+        if (memcmp(d + i, lfcrlf, 3) == 0) { out->pos = (ev_ssize_t)i; return 3; }
+    for (size_t i = 0; i + 2 <= len; i++)
+        if (memcmp(d + i, lf2, 2) == 0) { out->pos = (ev_ssize_t)i; return 2; }
+    return 0;
+}
+
 static char *hdr_blob(struct evbuffer *input, size_t *outlen) {
     if (!input) return NULL;
-    struct evbuffer_ptr end = evbuffer_search(input, "\r\n\r\n", 4, NULL);
-    size_t hlen = (end.pos == -1) ? evbuffer_get_length(input) : (size_t)end.pos + 4;
+    struct evbuffer_ptr end;
+    size_t term = find_header_end(input, &end);
+    size_t hlen = (end.pos == -1) ? evbuffer_get_length(input) : (size_t)end.pos + term;
     if (hlen == 0 || hlen > MAXBUF) return NULL;
     char *h = malloc(hlen + 1);
     if (!h) return NULL;
@@ -282,6 +307,15 @@ static void send_ws_101(proxy_ctx_t *ctx, struct evbuffer *input) {
         free(hdr);
     }
     bufferevent_write(ctx->client, resp, strlen(resp));
+    bufferevent_flush(ctx->client, EV_WRITE, BEV_FLUSH);
+}
+
+// 101 exato do proxy original (sem headers extras). Usado quando o cliente
+// não envia nada no aceite — o app CloudJF espera essa resposta para continuar.
+static void send_immediate_101(proxy_ctx_t *ctx) {
+    char r[128];
+    snprintf(r, sizeof(r), "HTTP/1.1 101 %s\r\n\r\n", RESPONSE);
+    bufferevent_write(ctx->client, r, strlen(r));
     bufferevent_flush(ctx->client, EV_WRITE, BEV_FLUSH);
 }
 
@@ -609,8 +643,9 @@ static void handle_http_connect(proxy_ctx_t *ctx, struct evbuffer *input,
     ctx->reply_len = strlen(r);
 
     // drina o cabeçalho HTTP para não vazar para o túnel
-    struct evbuffer_ptr end = evbuffer_search(input, "\r\n\r\n", 4, NULL);
-    if (end.pos != -1) evbuffer_drain(input, (size_t)end.pos + 4);
+    struct evbuffer_ptr end;
+    size_t term = find_header_end(input, &end);
+    if (end.pos != -1) evbuffer_drain(input, (size_t)end.pos + term);
 
     if (SOCKS_FORCE_LOCAL) connect_relay(ctx, "127.0.0.1", (uint16_t)TO_PORT);
     else connect_relay(ctx, target, (uint16_t)prt);
@@ -674,6 +709,9 @@ void client_read_cb(struct bufferevent *bev, void *user_data) {
     if (ctx->state == ST_INIT) {
         size_t len = evbuffer_get_length(input);
         if (len == 0) return;
+        // O cliente falou primeiro: cancela a janela de 50ms para não derrubar
+        // SOCKS/probe/WS enquanto o handshake está em andamento.
+        bufferevent_set_timeouts(bev, NULL, NULL);
         unsigned char first = 0;
         evbuffer_copyout(input, &first, 1);
 
@@ -702,7 +740,8 @@ void client_read_cb(struct bufferevent *bev, void *user_data) {
         evbuffer_copyout(input, peek, pn);
 
         if (starts_http(peek, pn)) {
-            struct evbuffer_ptr end = evbuffer_search(input, "\r\n\r\n", 4, NULL);
+            struct evbuffer_ptr end;
+            size_t term = find_header_end(input, &end);
             if (end.pos == -1) return; // espera headers completos
             size_t hlen = 0;
             char *hdr = hdr_blob(input, &hlen);
@@ -727,16 +766,30 @@ void client_read_cb(struct bufferevent *bev, void *user_data) {
                 return;
             }
             free(hdr);
-            if (!has_ws) { send_decoy(ctx); return; }
 
-            send_ws_101(ctx, input);
-            evbuffer_drain(input, (size_t)end.pos + 4);
-            ctx->state = ST_WS_MAGIC;
-            set_magic_timeouts(ctx);
+            if (IMMEDIATE_101 && ctx->sent_101) {
+                // O app CloudJF manda um preâmbulo HTTP "quebrado" depois do
+                // 101 imediato (GET sem path com \r\n\r\n antes do Host, e um
+                // decoy "ACL /"). Não é sondagem: só descarta o cabeçalho e
+                // continua esperando o magic real (npv-x / SSH-).
+                // O decoy continua ativo no modo estrito (--no-immediate-101).
+                evbuffer_drain(input, (size_t)end.pos + term);
+                ctx->state = ST_WS_MAGIC;
+                set_magic_timeouts(ctx);
+                // não retorna: processa magic que já esteja no buffer
+            } else {
+                if (!has_ws) { send_decoy(ctx); return; }
+                if (!ctx->sent_101) send_ws_101(ctx, input);
+                ctx->sent_101 = true;
+                evbuffer_drain(input, (size_t)end.pos + term);
+                ctx->state = ST_WS_MAGIC;
+                set_magic_timeouts(ctx);
+            }
             // processa magic que já esteja no buffer
         } else {
-            // Fluxo legado: 101 imediato e aguarda npv-x / SSH-
-            send_ws_101(ctx, input);
+            // Fluxo legado: aguarda npv-x / SSH-
+            if (!ctx->sent_101) send_ws_101(ctx, input);
+            ctx->sent_101 = true;
             ctx->state = ST_WS_MAGIC;
             set_magic_timeouts(ctx);
         }
@@ -793,9 +846,20 @@ void event_cb(struct bufferevent *bev, short events, void *user_data) {
 
     if (events & BEV_EVENT_TIMEOUT) {
         if (bev == ctx->client && ctx->state == ST_INIT) {
-            send_ws_101(ctx, NULL);
-            ctx->state = ST_WS_MAGIC;
-            set_magic_timeouts(ctx);
+            if (IMMEDIATE_101 && AUTH_TOKEN[0] == '\0' && !ctx->sent_101) {
+                // Cliente silenciou: envia o 101 exato do original e passa a
+                // esperar o magic (npv-x / SSH-) por mais 10s.
+                send_immediate_101(ctx);
+                ctx->sent_101 = true;
+                ctx->state = ST_WS_MAGIC;
+                // O libevent desabilita EV_READ após um timeout: reabilita
+                // para continuar lendo o preâmbulo e o magic do app.
+                bufferevent_enable(bev, EV_READ);
+                set_magic_timeouts(ctx);
+            } else {
+                // Modo estrito/com token: sem handshake válido, apenas fecha.
+                free_proxy_ctx(ctx);
+            }
             return;
         }
         free_proxy_ctx(ctx);
@@ -819,7 +883,11 @@ void accept_conn_cb(struct evconnlistener *listener, evutil_socket_t fd,
     set_keepalive(bev);
     bufferevent_setcb(bev, client_read_cb, NULL, event_cb, pc);
     bufferevent_enable(bev, EV_READ | EV_WRITE);
-    struct timeval tv = {1, 0};
+    // Janela curta para detectar SOCKS/probe/WS real. Se o cliente silenciar,
+    // o timeout envia o 101 exato do original (necessário para o app CloudJF).
+    // Com token ou --no-immediate-101, espera o handshake e valida antes.
+    struct timeval tv = (IMMEDIATE_101 && AUTH_TOKEN[0] == '\0') ?
+                        (struct timeval){0, 50000} : (struct timeval){10, 0};
     bufferevent_set_timeouts(bev, &tv, &tv);
 }
 
@@ -828,6 +896,7 @@ void print_usage_and_exit(const char *prog) {
         "Uso: %s [--port N] [--to|-to N] [--response TEXTO]\n"
         "  --no-dpi             desliga fragmentação/headers anti-DPI\n"
         "  --legacy-101         resposta 101 original exata\n"
+        "  --no-immediate-101   nao responde 101 no aceite (espera o GET WebSocket)\n"
         "  --socks-force-local  ignora destino SOCKS/CONNECT e usa 127.0.0.1:<to>\n"
         "  --no-keepalive       desliga TCP keepalive\n"
         "  --tls-target HOST:PORT  destino do ClientHello TLS (default 127.0.0.1:443)\n"
@@ -857,6 +926,7 @@ int main(int argc, char *argv[]) {
         } else if (strcmp(argv[i], "--response") == 0) {
             if (i+1 < argc) RESPONSE = argv[++i]; else print_usage_and_exit(argv[0]);
         } else if (strcmp(argv[i], "--no-dpi") == 0) DPI_ENABLED = false;
+        else if (strcmp(argv[i], "--no-immediate-101") == 0) IMMEDIATE_101 = false;
         else if (strcmp(argv[i], "--legacy-101") == 0) LEGACY_101 = true;
         else if (strcmp(argv[i], "--socks-force-local") == 0) SOCKS_FORCE_LOCAL = true;
         else if (strcmp(argv[i], "--no-keepalive") == 0) KEEPALIVE = false;
