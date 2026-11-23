@@ -96,7 +96,7 @@ const (
 	replayRetainMax = 256 << 20
 	replayRetainMin = 2 << 20
 	idleSessionTTL  = 15 * time.Minute // zumbi (app sumiu sem fechar limpo) e liberado logo; ajustavel via --idle
-	connIdleTO     = 600 * time.Second
+	connIdleTO     = 24 * time.Hour
 	connWriteTO    = 30 * time.Second  // timeout de escrita no app (mobile CGNAT precisa de mais tempo)
 	chunkWait      = 500 * time.Millisecond
 	maxPendingUp   = 8192 // frames de upload fora de ordem (sanidade)

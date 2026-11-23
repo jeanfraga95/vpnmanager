@@ -27,6 +27,7 @@ char* RESPONSE = "OK";
 // DPI bypass (ativo por padrão — use --no-dpi para desligar)
 bool DPI_ENABLED = true;
 bool LEGACY_101 = false;
+bool WAIT_MAGIC = true;          // hibrido: so envia 200 apos npv-x/SSH-
 bool SOCKS_FORCE_LOCAL = false;
 int DPI_FRAG_BYTES = 48;
 int DPI_CHUNK = 8;
@@ -64,6 +65,10 @@ typedef struct {
     bool connected_to_remote;
     bool freed;
     bool sent_101;               // evita responder 101 duas vezes na mesma conexão
+    bool ssh_banner_sent;        // so encaminha ao sshd apos banner SSH valido
+    bool in_control;             // descartando cabecalho HTTP parcial
+    bool magic_ready;            // npv-x recebido no cabecalho HTTP
+    bool raw_tunnel;             // CONNECT/SOCKS/TLS: nao filtrar banner SSH
     struct event *magic_timer;   // timeout explícito (libevent não rearma sozinho)
     int frag_in;
     int frag_out;
@@ -100,7 +105,7 @@ static void clear_magic_timer(proxy_ctx_t *ctx) {
     }
 }
 
-// Fecha conexões que ficaram ociosas esperando o magic (10s, como o original)
+// Segurança: só fecha se o estado ainda for ST_WS_MAGIC após 24h (não ocioso real)
 static void magic_timeout_cb(evutil_socket_t fd, short what, void *arg) {
     proxy_ctx_t *ctx = arg;
     (void)fd; (void)what;
@@ -166,13 +171,14 @@ static void set_nodelay(struct bufferevent *bev) {
 }
 
 static void set_magic_timeouts(proxy_ctx_t *ctx) {
-    // Mantém o timeout de 10s do proxy original para conexões ociosas.
-    // Usamos um timer de evento explícito: o timeout do bufferevent não rearma
-    // depois de disparar, o que deixava a conexão pendurada para sempre.
+    // SEM timeout ocioso: o app pode demorar depois do 101 para enviar o
+    // magic (npv-x/SSH-). Um timeout curto aqui derrubava a conexão e gerava
+    // "connection is closed by foreign host" / "Read timed out" no app.
+    // 24h = ilimitado na pratica; o timer é limpo em connect_relay().
     if (!ctx || !ctx->client) return;
     clear_magic_timer(ctx);
     ctx->magic_timer = evtimer_new(base, magic_timeout_cb, ctx);
-    struct timeval tv = {10, 0};
+    struct timeval tv = {86400, 0};
     if (ctx->magic_timer) evtimer_add(ctx->magic_timer, &tv);
     bufferevent_set_timeouts(ctx->client, NULL, NULL);
 }
@@ -440,8 +446,8 @@ static bool connect_relay(proxy_ctx_t *ctx, const char *host, uint16_t port) {
         return false;
     }
     ctx->state = ST_RELAY;
-    ctx->frag_in = DPI_ENABLED ? DPI_FRAG_BYTES : 0;
-    ctx->frag_out = DPI_ENABLED ? DPI_FRAG_BYTES : 0;
+    ctx->frag_in = (DPI_ENABLED && !ctx->raw_tunnel) ? DPI_FRAG_BYTES : 0;
+    ctx->frag_out = (DPI_ENABLED && !ctx->raw_tunnel) ? DPI_FRAG_BYTES : 0;
     return true;
 }
 
@@ -566,6 +572,7 @@ static void socks5_handle_request(proxy_ctx_t *ctx, struct evbuffer *input) {
     memcpy(ctx->reply, rep, sizeof(rep));
     ctx->reply_len = sizeof(rep);
 
+    ctx->raw_tunnel = true;
     if (SOCKS_FORCE_LOCAL) connect_relay(ctx, "127.0.0.1", (uint16_t)TO_PORT);
     else connect_relay(ctx, host, port);
 }
@@ -616,6 +623,7 @@ static void socks4_handle_request(proxy_ctx_t *ctx, struct evbuffer *input) {
     memcpy(ctx->reply, rep, sizeof(rep));
     ctx->reply_len = sizeof(rep);
 
+    ctx->raw_tunnel = true;
     if (SOCKS_FORCE_LOCAL) connect_relay(ctx, "127.0.0.1", (uint16_t)TO_PORT);
     else connect_relay(ctx, host, port);
 }
@@ -647,6 +655,7 @@ static void handle_http_connect(proxy_ctx_t *ctx, struct evbuffer *input,
     size_t term = find_header_end(input, &end);
     if (end.pos != -1) evbuffer_drain(input, (size_t)end.pos + term);
 
+    ctx->raw_tunnel = true;
     if (SOCKS_FORCE_LOCAL) connect_relay(ctx, "127.0.0.1", (uint16_t)TO_PORT);
     else connect_relay(ctx, target, (uint16_t)prt);
 }
@@ -680,6 +689,7 @@ static void handle_tls(proxy_ctx_t *ctx, struct evbuffer *input) {
     ctx->pending_len = keep;
     evbuffer_drain(input, keep);
 
+    ctx->raw_tunnel = true;
     connect_relay(ctx, TLS_TARGET_HOST, (uint16_t)TLS_TARGET_PORT);
 }
 
@@ -699,6 +709,170 @@ static bool starts_http(const char *b, size_t n) {
         if (n >= l && memcmp(b, ms[i], l) == 0) return true;
     }
     return false;
+}
+
+// Antes do banner SSH, o app dispara decoys/DPI (POLL, ACL, MERGE,
+// BASELINE-CONTROL, lixo binario). Nada disso pode chegar ao sshd: ele fecha
+// com "invalid protocol identifier" e o app mostra "connection closed by
+// foreign host". Descarta tudo ate o cliente enviar um banner SSH real.
+static bool strip_ws_control(proxy_ctx_t *ctx, struct evbuffer *input);
+
+static bool filter_client_to_ssh(proxy_ctx_t *ctx, struct evbuffer *input) {
+    if (!ctx || !input) return true;
+    if (!ctx->ssh_banner_sent) {
+        struct evbuffer_ptr p = evbuffer_search(input, "SSH-", 4, NULL);
+        if (p.pos == -1) {
+            evbuffer_drain(input, evbuffer_get_length(input));
+            return false;
+        }
+        if (p.pos > 0) evbuffer_drain(input, (size_t)p.pos);
+        ctx->ssh_banner_sent = true;
+    }
+    return strip_ws_control(ctx, input);
+}
+
+// Tuneis raw (CONNECT/SOCKS/TLS) nao passam pelo filtro de banner SSH:
+// o ClientHello TLS e o payload SOCKS nao contem "SSH-" e seriam descartados.
+static bool filter_client(proxy_ctx_t *ctx, struct evbuffer *input) {
+    if (!ctx || !input) return true;
+    if (ctx->raw_tunnel) return true;
+    return filter_client_to_ssh(ctx, input);
+}
+
+// O app CloudJF envia mensagens de controle HTTP pelo mesmo tunel SSH:
+// preambulo GET/ACL e keepalive "POLL / HTTP/1.1". Se isso chegar ao sshd,
+// ele fecha com "invalid protocol identifier" / "banner line invalid".
+// Remove tambem o magic legado npv-x. Retorna false se o cabecalho ainda
+// esta incompleto (para nao repassar bytes parciais ao sshd).
+static bool strip_ws_control(proxy_ctx_t *ctx, struct evbuffer *input) {
+    if (!input) return true;
+    static const char *methods[] = {
+        "GET", "POST", "PUT", "PATCH", "PATH", "DELETE", "HEAD", "OPTIONS",
+        "CONNECT", "TRACE", "ACL", "UNLOCK", "LOCK", "MKCOL", "COPY", "MOVE",
+        "PROPFIND", "PROPPATCH", "PROPATH", "POLL", "SEARCH", "MERGE",
+        "BASELINE-CONTROL", "REPORT", "MKACTIVITY", "CHECKOUT", "UPDATE",
+        "VERSION-CONTROL", "BIND", "UNBIND", "REBIND", "LINK", "UNLINK",
+        "PURGE", "MKCALENDAR", "SUBSCRIBE", "UNSUBSCRIBE", "NOTIFY", "PUBLISH",
+        "M-SEARCH", "NOTIFY", "SOURCE", "QUERY", "INDEX", "SCAN", "PING",
+        "BASELINE", "LABEL", "ORDERPATCH", "ACL-ANSWER", NULL
+    };
+    for (;;) {
+        size_t len = evbuffer_get_length(input);
+        if (len == 0) return true;
+
+        // Cabecalho de controle parcial: descarta ate a linha em branco
+        if (ctx->in_control) {
+            struct evbuffer_ptr e;
+            size_t t = find_header_end(input, &e);
+            if (e.pos != -1 && (size_t)e.pos + t <= len) {
+                evbuffer_drain(input, (size_t)e.pos + t);
+                ctx->in_control = false;
+                continue;
+            }
+            evbuffer_drain(input, len);
+            return false;
+        }
+
+        // magic legado do app (pode vir a qualquer momento)
+        if (len >= 5) {
+            unsigned char b5[5];
+            evbuffer_copyout(input, b5, 5);
+            if (memcmp(b5, "npv-x", 5) == 0) {
+                evbuffer_drain(input, 5);
+                continue;
+            }
+        }
+
+        // so texto que comeca com Token maiusculo pode ser controle HTTP.
+        // banner SSH ("SSH-2.0-...") e binario naiveo nao batem aqui.
+        unsigned char c0 = 0;
+        evbuffer_copyout(input, &c0, 1);
+        if (!((c0 >= 'A' && c0 <= 'Z'))) return true;
+
+        size_t peeklen = len < 255 ? len : 255;
+        char first[256] = {0};
+        evbuffer_copyout(input, first, peeklen);
+        size_t fl = 0;
+        while (fl < peeklen && first[fl] != '\r' && first[fl] != '\n') fl++;
+        first[fl] = '\0';
+
+        char method[40] = {0};
+        size_t m = 0;
+        while (m < fl && m < sizeof(method)-1 && first[m] != ' ') {
+            method[m] = first[m]; m++;
+        }
+        method[m] = '\0';
+
+        bool ctl = (strstr(first, "HTTP/") != NULL);
+        if (!ctl) {
+            for (int j = 0; methods[j] != NULL; j++) {
+                if (strcmp(method, methods[j]) == 0) { ctl = true; break; }
+            }
+        }
+        if (!ctl) return true;
+
+        // com cabecalho completo: descarta bloco inteiro ate linha em branco
+        struct evbuffer_ptr end;
+        size_t term = find_header_end(input, &end);
+        if (end.pos != -1 && (size_t)end.pos + term <= len) {
+            evbuffer_drain(input, (size_t)end.pos + term);
+            continue;
+        }
+
+        // sem cabecalho completo: entra em modo descarte ate 
+
+
+        ctx->in_control = true;
+        evbuffer_drain(input, len);
+        return false;
+
+        ctx->in_control = true;
+        evbuffer_drain(input, len);
+        return false;
+    }
+}
+
+// Hibrido (timing do hsproxy): so completa o handshake quando o app envia
+// npv-x (header HTTP ou payload legado) ou o banner SSH-. Decoys HTTP sao
+// descartados sem responder 200. Mantem o filtro, o DPI e o keepalive.
+static bool start_ws_on_magic(proxy_ctx_t *ctx, struct evbuffer *input) {
+    if (!ctx || ctx->connected_to_remote || !input) return false;
+
+    struct evbuffer_ptr ssh = evbuffer_search(input, "SSH-", 4, NULL);
+    if (ssh.pos != -1) {
+        if (ssh.pos > 0) evbuffer_drain(input, (size_t)ssh.pos);
+        send_http_200(ctx);
+        start_remote(ctx);
+        return true;
+    }
+
+    struct evbuffer_ptr p = evbuffer_search(input, "npv-x", 5, NULL);
+    if (p.pos != -1) {
+        evbuffer_drain(input, (size_t)p.pos + 5);
+        send_http_200(ctx);
+        start_remote(ctx);
+        return true;
+    }
+
+    strip_ws_control(ctx, input);
+    return false;
+}
+
+// Compatibilidade: o app nao precisa mais enviar o magic "npv-x".
+// Responde 200 e conecta ao SSH local. Se o app ainda enviar o magic legado
+// no inicio do payload, ele e descartado em vez de chegar ao sshd como banner.
+static void start_ws_relay(proxy_ctx_t *ctx, struct evbuffer *input) {
+    if (!ctx || ctx->connected_to_remote) return;
+    if (input) {
+        struct evbuffer_ptr p = evbuffer_search(input, "npv-x", 5, NULL);
+        if (p.pos == 0) {
+            evbuffer_drain(input, 5);
+        } else if (p.pos > 0 && p.pos < 64) {
+            evbuffer_drain(input, (size_t)p.pos + 5);
+        }
+    }
+    send_http_200(ctx);
+    start_remote(ctx);
 }
 
 void client_read_cb(struct bufferevent *bev, void *user_data) {
@@ -765,6 +939,8 @@ void client_read_cb(struct bufferevent *bev, void *user_data) {
                 send_403(ctx);
                 return;
             }
+            // iOS envia npv-x como header da requisicao: conta como magic.
+            if (hdr && strcasestr(hdr, "npv-x") != NULL) ctx->magic_ready = true;
             free(hdr);
 
             if (IMMEDIATE_101 && ctx->sent_101) {
@@ -802,23 +978,31 @@ void client_read_cb(struct bufferevent *bev, void *user_data) {
     if (ctx->state == ST_TLS) { handle_tls(ctx, input); return; }
 
     if (ctx->connected_to_remote && ctx->remote && !ctx->freed) {
-        relay_with_dpi(ctx->remote, input, &ctx->frag_in);
+        if (filter_client(ctx, input))
+            relay_with_dpi(ctx->remote, input, &ctx->frag_in);
         return;
     }
 
     if (ctx->state == ST_WS_MAGIC) {
-        struct evbuffer_ptr p_npv = evbuffer_search(input, "npv-x", 5, NULL);
-        if (p_npv.pos != -1) {
+        // Hibrido: o 200 so sai depois que o app enviou npv-x (header/payload)
+        // ou o banner SSH-. Isso mantem o timing do hsproxy sem perder o filtro
+        // de decoys, o DPI, o keepalive e o timeout de 24h do proxy novo.
+        bool started = false;
+        if (!WAIT_MAGIC) {
+            start_ws_relay(ctx, input);
+            started = ctx->connected_to_remote;
+        } else if (ctx->magic_ready) {
+            ctx->magic_ready = false;
             send_http_200(ctx);
-            evbuffer_drain(input, evbuffer_get_length(input));
             start_remote(ctx);
-            return;
+            started = true;
+        } else {
+            started = start_ws_on_magic(ctx, input);
         }
-        struct evbuffer_ptr ssh = evbuffer_search(input, "SSH-", 4, NULL);
-        if (ssh.pos == -1) return;
-        send_http_200(ctx);
-        evbuffer_drain(input, (size_t)ssh.pos);
-        start_remote(ctx);
+        if (started && ctx->connected_to_remote && evbuffer_get_length(input) > 0 &&
+            filter_client_to_ssh(ctx, input))
+            relay_with_dpi(ctx->remote, input, &ctx->frag_in);
+        return;
     }
 }
 
@@ -838,7 +1022,7 @@ void event_cb(struct bufferevent *bev, short events, void *user_data) {
                 ctx->pending_len = 0;
             }
             struct evbuffer *ci = bufferevent_get_input(ctx->client);
-            if (evbuffer_get_length(ci) > 0)
+            if (filter_client(ctx, ci) && evbuffer_get_length(ci) > 0)
                 relay_with_dpi(ctx->remote, ci, &ctx->frag_in);
         }
         return;
@@ -897,6 +1081,7 @@ void print_usage_and_exit(const char *prog) {
         "  --no-dpi             desliga fragmentação/headers anti-DPI\n"
         "  --legacy-101         resposta 101 original exata\n"
         "  --no-immediate-101   nao responde 101 no aceite (espera o GET WebSocket)\n"
+        "  --auto-200           responde 200 imediatamente (modo anterior)\n"
         "  --socks-force-local  ignora destino SOCKS/CONNECT e usa 127.0.0.1:<to>\n"
         "  --no-keepalive       desliga TCP keepalive\n"
         "  --tls-target HOST:PORT  destino do ClientHello TLS (default 127.0.0.1:443)\n"
@@ -927,6 +1112,7 @@ int main(int argc, char *argv[]) {
             if (i+1 < argc) RESPONSE = argv[++i]; else print_usage_and_exit(argv[0]);
         } else if (strcmp(argv[i], "--no-dpi") == 0) DPI_ENABLED = false;
         else if (strcmp(argv[i], "--no-immediate-101") == 0) IMMEDIATE_101 = false;
+        else if (strcmp(argv[i], "--auto-200") == 0) WAIT_MAGIC = false;
         else if (strcmp(argv[i], "--legacy-101") == 0) LEGACY_101 = true;
         else if (strcmp(argv[i], "--socks-force-local") == 0) SOCKS_FORCE_LOCAL = true;
         else if (strcmp(argv[i], "--no-keepalive") == 0) KEEPALIVE = false;

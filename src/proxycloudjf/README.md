@@ -12,8 +12,20 @@ O fluxo original continua sendo o padrão:
 3. app envia `npv-x` (ou `SSH-`)
 4. proxy responde `200` e conecta ao SSH local (`127.0.0.1:22`)
 
-Nada precisa mudar no app. Os recursos novos são ativados por detecção de
-protocolo ou por flags opcionais.
+Nada precisa mudar no app. `npv-x` é **opcional**: se o app mandar o banner
+`SSH-` direto, o `200` também é disparado. Os recursos novos são ativados por
+detecção de protocolo ou por flags opcionais.
+
+## Comportamento híbrido (padrão)
+
+O `200` só sai depois que o app envia `npv-x` (header HTTP ou payload legado) ou
+o banner `SSH-`. Isso reproduz o timing do hsproxy, mas mantém as vantagens do
+proxy novo:
+
+- decoys HTTP são descartados **sem responder `200`**
+- filtro de decoys continua ativo antes do sshd
+- DPI, keepalive TCP e timeout ocioso de `24h` continuam ativos
+- `--auto-200` volta ao modo antigo (responde `200` imediatamente no aceite)
 
 ## Recursos incluídos
 
@@ -26,6 +38,16 @@ protocolo ou por flags opcionais.
 - **HTTP CONNECT**: túnel padrão com `200 Connection Established`.
 - **Decoy anti-sondagem**: requisições HTTP sem `Upgrade: websocket` recebem
   uma página nginx plausível em vez de `101`.
+- **Filtro de decoys no túnel SSH**: `GET, POST, PUT, PATCH, PATH, ACL, UNLOCK,
+  MKCOL, DELETE, PROPPATCH, POLL, SEARCH` e outros são removidos antes do sshd,
+  inclusive cabeçalhos parcelados ou sem linha final. O magic legado `npv-x`
+  também é descartado. Isso evita `invalid protocol identifier` /
+  `banner line invalid` no sshd.
+- **`raw_tunnel` (correção importante)**: `CONNECT`, SOCKS4/5 e TLS ClientHello
+  marcados como túnel cru não passam pelo filtro de banner SSH (que exigia
+  `SSH-` e descartava o `ClientHello`/payload SOCKS). Nesses túneis a
+  fragmentação anti-DPI também é desligada. É o que faz `proxy` e `ssl_proxy`
+  funcionarem.
 - **TLS ClientHello / SNI**: detecta `0x16 0x03`, extrai o SNI e encaminha ao
   destino configurado; SNI não permitido recebe o decoy.
 - **Token opcional**: desligado por padrão. Quando ativo, aceita
@@ -36,7 +58,9 @@ protocolo ou por flags opcionais.
   necessário porque o app CloudJF espera o 101 antes de enviar qualquer dado.
   Se o cliente falar primeiro (SOCKS, probe, WS real), o protocolo é detectado
   normalmente e o 101 não é enviado antecipadamente.
-- **Timeout ocioso**: 10s esperando o magic, igual ao proxy original.
+- **Timeout ocioso: 24h** (86400s). O app pode demorar depois do `101` para
+  enviar o magic sem a conexão cair. **Não usar `--idle 0`**. O timer é limpo ao
+  conectar ao relay. O BHTTP usa `connIdleTO = 24h` e `--idle 24h`.
 
 ## Flags
 
@@ -47,6 +71,7 @@ protocolo ou por flags opcionais.
 --no-dpi                 desliga fragmentação anti-DPI
 --legacy-101             resposta 101 original exata
 --no-immediate-101       não envia 101 no aceite (exige GET WebSocket)
+--auto-200               responde 200 imediatamente (modo antigo, sem híbrido)
 --socks-force-local      ignora destino SOCKS/CONNECT e usa 127.0.0.1:<to>
 --no-keepalive           desliga TCP keepalive
 --tls-target HOST:PORT   destino do ClientHello (padrão 127.0.0.1:443)
@@ -59,12 +84,14 @@ protocolo ou por flags opcionais.
 
 ## Rollback rápido (sem trocar binário)
 
+- `--auto-200` — volta ao `200` imediato do modo antigo
 - `--legacy-101` — volta à resposta `101 OK` exata
 - `--no-dpi` — desliga a fragmentação
 - `--no-keepalive` — desliga keepalive
 - `--no-immediate-101` — volta ao handshake WS estrito (espera o GET)
 
 Para voltar ao binário anterior: `/etc/VPNManager/bin/proxy.bak_pre_dpi`.
+Restore da versão corrigida no VPS: `/root/restore_rawfix_20261123.sh`.
 
 ## Build
 
@@ -76,10 +103,21 @@ Para voltar ao binário anterior: `/etc/VPNManager/bin/proxy.bak_pre_dpi`.
 
 Dependências: `gcc`, `libevent-dev`, `libssl-dev` (e Docker/qemu para x86_64).
 
+Binário ativo: md5 `6321c4873f1b8f3bec756ab164b19271`
+(`bin/aarch64/proxy` → `/etc/VPNManager/bin/proxy`).
+
 ## Validação
 
 Testes usados em produção:
 
 - `WS->SSH`, `SOCKS5`, `SOCKS4`, `CONNECT`, `DECOY`, `LEGADO` — 6/6
 - token e SNI/decoy — 6/6
+- payload real rotacionado: 54 blocos em `18091/18092/18093` — 0 problemas
+- matriz de modos: `direct` e `ssl_direct` idênticos; `proxy` (CONNECT) e
+  `ssl_proxy` só funcionam no patched corrigido
+- `ssl_proxy`: `9443` → nginx `200`, `443` → xray `400`, `10443` → XHTTP `200`
+  (`80` com TLS puro dá `EOF` porque a 80 é BHTTP — esperado)
 - fluxo real `80 -> fallback -> 8080 -> WS -> magic -> SSH` — OK
+- produção: `101` → `POLL` → `npv-x` → `200` + banner, usuários reais
+  autenticando, nenhum `invalid protocol identifier`
+- porta 80 BHTTP: `AUTENTICADO_PORTA_80`, vivo `700s`, `RC=0`
