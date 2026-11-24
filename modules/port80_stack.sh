@@ -188,6 +188,11 @@ echo "Stack VPNManager (porta 80, sem nginx):"
 for s in vpnproxy-bhttp-80 vpnproxy-fallback vpnproxy-ws-8080 vpnproxy-xhttp-11443 hcr-server sshd-bhttp; do
     printf '  %-28s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || echo missing)"
 done
+main=$(ps -eo pid,args | awk '/\/usr\/sbin\/sshd -D/ && !/sshd_config_bhttp/ && !/awk/ {print $1; exit}')
+startups=$(ps -o args= -p "$main" 2>/dev/null | grep -oE '[0-9]+ of [0-9]+-[0-9]+ startups' | awk '{print $1}')
+[ -z "$startups" ] && startups=0
+preauth=$(ps -eo pid,ppid,etimes,args | awk -v m="$main" '$2==m && /\[accepted\]/ {n++} END {print n+0}')
+printf '  %-28s %s (%s pre-auth)\n' "sshd 22" "$startups/300" "$preauth"
 echo
 echo "Portas publicas: 80/tcp BHTTP+WS+XHTTP+HCR, 8080/tcp WebSocket legado"
 echo "Portas fechadas: 8443, 8787, 8788, 9090, 9443, 18082, 11443"

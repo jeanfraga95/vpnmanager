@@ -82,6 +82,21 @@ Ela não configura o app nem o BHTTP automaticamente e recusa uma porta já
 aberta/em uso (não dá para reabrir a 8080). Para a porta 80, use a opção 10
 (BHTTP).
 
+### Protecao SSH (24/11/2026)
+
+Todos os caminhos (BHTTP, XHTTP, WebSocket e HCR) autenticam no sshd da
+porta 22. Com `LoginGraceTime 0`, conexoes abandonadas pelos proxies ficavam
+abertas para sempre, esgotavam `MaxStartups` e causavam o sintoma
+`101 -> 200` sem banner SSH.
+
+- `LoginGraceTime 60`, `MaxStartups 300:30:600`, `MaxSessions 100`.
+- `modules/sshd_auth_guard.sh` roda a cada 2 min pelo healthcheck: remove
+  somente conexoes **pre-auth** abandonadas (>70s) e filhos `[priv]` orfaos,
+  nunca sessoes autenticadas; alerta se `startups >= 250`.
+- `vpnmanager-stack` mostra a carga do sshd e a quantidade de pre-auth.
+- Validado: conexao abandonada removida em 60s; `101 -> 200 -> SSH` voltou
+  a funcionar no IP direto e no CDN.
+
 ### Validação
 
 - Payload real rotacionado: 54 blocos em `18091/18092/18093` → 0 problemas.

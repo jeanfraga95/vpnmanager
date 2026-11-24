@@ -102,6 +102,7 @@ step_copy_modules(){
     cp "$SCRIPT_DIR/modules/linguagem.sh"     "$INSTALL_DIR/modules/linguagem.sh"
     cp "$SCRIPT_DIR/modules/swap.sh"          "$INSTALL_DIR/modules/swap.sh"
     cp "$SCRIPT_DIR/modules/healthcheck.sh"    "$INSTALL_DIR/modules/healthcheck.sh"
+    cp "$SCRIPT_DIR/modules/sshd_auth_guard.sh" "$INSTALL_DIR/modules/sshd_auth_guard.sh"
     chmod +x "$INSTALL_DIR/menu.sh"
     chmod +x "$INSTALL_DIR/modules/"*.sh
     ln -sf "$INSTALL_DIR/menu.sh" "$BIN_LINK"
@@ -366,6 +367,8 @@ SVC
         cp "$INSTALL_DIR/modules/vpnmanager-healthcheck.timer" /etc/systemd/system/ 2>/dev/null || true
     fi
     chmod +x "$INSTALL_DIR/modules/healthcheck.sh" 2>/dev/null || true
+    chmod +x "$INSTALL_DIR/modules/sshd_auth_guard.sh" 2>/dev/null || true
+    bash "$INSTALL_DIR/modules/sshd_auth_guard.sh" >/dev/null 2>&1 || true
     systemctl enable vpnmanager-healthcheck.timer >/dev/null 2>&1 || true
     systemctl start vpnmanager-healthcheck.timer >/dev/null 2>&1 || true
     timeout 15 systemctl daemon-reload 2>/dev/null || true
