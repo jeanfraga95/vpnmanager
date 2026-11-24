@@ -29,6 +29,7 @@ O proxy em produção é o binário **patched/híbrido**:
   `npv-x` (header HTTP ou payload legado) ou o banner `SSH-`. Isso mantém o
   timing do hsproxy sem perder filtro de decoys, DPI, keepalive e timeout 24h.
   `--auto-200` volta ao modo antigo (responde `200` imediatamente).
+- Produção 24/11/2026: WS 8080 rodando com `--auto-200` (`101` → `200` imediato); XHTTP real em `11443`, com fallback, `port80_stack.sh` e healthcheck atualizados.
 - **`npv-x` é opcional**: se aparecer, é descartado; se não aparecer, o banner
   `SSH-` também dispara o `200`.
 - **Filtro completo de decoys**: `GET, POST, PUT, PATCH, PATH, ACL, UNLOCK,
@@ -40,7 +41,7 @@ O proxy em produção é o binário **patched/híbrido**:
 - **BHTTP/QUIC**: sniff fragmentado com `prefixConn`, `MaxIdleTimeout 300s` e
   `KeepAlivePeriod 30s`.
 - **`ssl_proxy` corrigido**: `9443` → nginx `200`, `443` → xray `400`,
-  `10443` → XHTTP `200`. Na porta `80` TLS puro dá `EOF` porque a 80 é BHTTP
+  `11443` → XHTTP `200`. Na porta `80` TLS puro dá `EOF` porque a 80 é BHTTP
   (comportamento esperado).
 
 ### Portas em produção
@@ -53,7 +54,7 @@ O proxy em produção é o binário **patched/híbrido**:
 | 443 | xray |
 | 8443 | HCR |
 | 9443 | nginx |
-| 10443 | SSH XHTTP |
+| 11443 | SSH XHTTP |
 | 18082 | hcr-server |
 | 22 / 2223 | sshd / sshd-bhttp |
 

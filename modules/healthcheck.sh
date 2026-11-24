@@ -6,7 +6,7 @@ INSTALL_DIR="/etc/VPNManager"
 LOG="/var/log/vpnmanager_healthcheck.log"
 
 # Lista de servicos criticos (podem nao existir em todas instalacoes)
-CRITICAL_SVCS="vpnproxy-bhttp-80 hcr-server vpnproxy-hcr-tcp vpnproxy-hcr-quic vpnproxy-xhttp-10443 vpnproxy-fallback sshd-bhttp checkuser"
+CRITICAL_SVCS="vpnproxy-bhttp-80 hcr-server vpnproxy-hcr-tcp vpnproxy-hcr-quic vpnproxy-xhttp-11443 vpnproxy-fallback sshd-bhttp checkuser"
 
 for sn in $CRITICAL_SVCS; do
     # Ignora servicos nao instalados

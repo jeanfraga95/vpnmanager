@@ -109,8 +109,8 @@ fi
 cat > /etc/systemd/system/vpnproxy-port80.service << EOF
 [Unit]
 Description=VPNManager Port 80 Proxy (HCR + WebSocket + XHTTP + BHTTP)
-After=network.target hcr-server.service vpnproxy-bhttp-18083.service vpnproxy-xhttp-10443.service
-Wants=hcr-server.service vpnproxy-bhttp-18083.service vpnproxy-xhttp-10443.service
+After=network.target hcr-server.service vpnproxy-bhttp-18083.service vpnproxy-xhttp-11443.service
+Wants=hcr-server.service vpnproxy-bhttp-18083.service vpnproxy-xhttp-11443.service
 [Service]
 Type=simple
 ExecStart=$PROXY80_BIN
@@ -125,9 +125,9 @@ systemctl daemon-reload
 systemctl enable hcr-server vpnproxy-bhttp-18083 vpnproxy-port80 >/dev/null 2>&1 || true
 systemctl restart hcr-server vpnproxy-bhttp-18083 vpnproxy-port80
 
-# garantir que o xhttp esteja ativo (porta 10443)
-systemctl enable vpnproxy-xhttp-10443 >/dev/null 2>&1 || true
-systemctl start vpnproxy-xhttp-10443 >/dev/null 2>&1 || true
+# garantir que o xhttp esteja ativo (porta 11443)
+systemctl enable vpnproxy-xhttp-11443 >/dev/null 2>&1 || true
+systemctl start vpnproxy-xhttp-11443 >/dev/null 2>&1 || true
 
 echo "port 80 stack active"
 echo "Stack port 80 (WebSocket/BHTTP/HCR/XHTTP) ativo via proxy80."

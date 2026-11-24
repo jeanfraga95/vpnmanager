@@ -12,7 +12,7 @@ import (
 var (
 	hcrTarget   = "127.0.0.1:18082"
 	wsTarget    = "127.0.0.1:8080"
-	xhttpTarget = "127.0.0.1:10443"
+	xhttpTarget = "127.0.0.1:11443"
 )
 
 // isHCRPlainOperation verifica se o byte e uma operacao HCR valida (1-6)
