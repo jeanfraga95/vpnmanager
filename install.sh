@@ -149,6 +149,11 @@ step_sys_tune(){
     _sysctl_persist "net.ipv4.tcp_tw_reuse" "1"
     _sysctl_persist "net.ipv6.conf.all.disable_ipv6" "1"
     _sysctl_persist "net.ipv6.conf.default.disable_ipv6" "1"
+    # Backlog de rede maior (absorve rajadas; alinhado com a sshplus).
+    if [ -f "$SCRIPT_DIR/sysctl-99-udp-buffers.conf" ]; then
+        cp "$SCRIPT_DIR/sysctl-99-udp-buffers.conf" /etc/sysctl.d/99-udp-buffers.conf
+        sysctl -w net.core.netdev_max_backlog=100000 >/dev/null 2>&1 || true
+    fi
     sysctl -p >/dev/null 2>&1 || true
 }
 

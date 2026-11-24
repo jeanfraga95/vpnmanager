@@ -97,6 +97,26 @@ abertas para sempre, esgotavam `MaxStartups` e causavam o sintoma
 - Validado: conexao abandonada removida em 60s; `101 -> 200 -> SSH` voltou
   a funcionar no IP direto e no CDN.
 
+### Comparacao com a VPS sshplus (24/11/2026)
+
+A VPS sshplus (167.126.9.217) usa configuracoes **mais fracas** nos pontos
+criticos: `LoginGraceTime 120`, `MaxStartups 10:30:100`, sem `MaxSessions`
+e sem watchdog de pre-auth. Nao foi copiado nada que enfraquece o vpnmanager.
+
+Alem disso, foi encontrado o **mesmo vazamento de conexoes pre-auth no sshd
+interno do BHTTP (2223)**: 4 processos `[accepted]` presos por ate 107
+minutos, com apenas 10 slots. O guard foi estendido para os DOIS listeners:
+
+- `sshd 22` e `sshd 2223` com `LoginGraceTime 60`, `MaxStartups 300:30:600`,
+  `MaxSessions 100`.
+- `sshd_auth_guard.sh` limpa pre-auth em ambos e recarrega via SIGHUP sem
+  derrubar sessoes autenticadas.
+- Template de reinstallacao (`port80_stack.sh`) corrigido para nao reintroduzir
+  `LoginGraceTime 0` no sshd do BHTTP.
+- `vpnmanager-stack` mostra a carga dos dois listeners.
+- Unico ajuste adotado da sshplus: `net.core.netdev_max_backlog=100000`
+  (era 65536), para absorber rajadas de pacotes.
+
 ### Validação
 
 - Payload real rotacionado: 54 blocos em `18091/18092/18093` → 0 problemas.

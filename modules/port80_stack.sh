@@ -48,8 +48,10 @@ PermitRootLogin yes
 PasswordAuthentication yes
 AllowTcpForwarding yes
 GatewayPorts yes
-ClientAliveInterval 30
-ClientAliveCountMax 5
+ClientAliveInterval 10
+ClientAliveCountMax 3600
+LoginGraceTime 60
+MaxStartups 300:30:600
 MaxSessions 100
 LogLevel INFO
 UsePAM yes
@@ -193,6 +195,11 @@ startups=$(ps -o args= -p "$main" 2>/dev/null | grep -oE '[0-9]+ of [0-9]+-[0-9]
 [ -z "$startups" ] && startups=0
 preauth=$(ps -eo pid,ppid,etimes,args | awk -v m="$main" '$2==m && /\[accepted\]/ {n++} END {print n+0}')
 printf '  %-28s %s (%s pre-auth)\n' "sshd 22" "$startups/300" "$preauth"
+mainb=$(ps -eo pid,args | awk '/\/usr\/sbin\/sshd -D -f \/etc\/ssh\/sshd_config_bhttp/ && !/awk/ {print $1; exit}')
+startupsb=$(ps -o args= -p "$mainb" 2>/dev/null | grep -oE '[0-9]+ of [0-9]+-[0-9]+ startups' | awk '{print $1}')
+[ -z "$startupsb" ] && startupsb=0
+preauthb=$(ps -eo pid,ppid,etimes,args | awk -v m="$mainb" '$2==m && /\[accepted\]/ {n++} END {print n+0}')
+printf '  %-28s %s (%s pre-auth)\n' "sshd 2223" "$startupsb/300" "$preauthb"
 echo
 echo "Portas publicas: 80/tcp BHTTP+WS+XHTTP+HCR, 8080/tcp WebSocket legado"
 echo "Portas fechadas: 8443, 8787, 8788, 9090, 9443, 18082, 11443"
