@@ -6,7 +6,7 @@ INSTALL_DIR="/etc/VPNManager"
 LOG="/var/log/vpnmanager_healthcheck.log"
 
 # Lista de servicos criticos (podem nao existir em todas instalacoes)
-CRITICAL_SVCS="vpnproxy-bhttp-80 hcr-server vpnproxy-hcr-tcp vpnproxy-hcr-quic vpnproxy-xhttp-11443 vpnproxy-fallback sshd-bhttp checkuser"
+CRITICAL_SVCS="vpnproxy-bhttp-80 vpnproxy-fallback vpnproxy-ws-8080 vpnproxy-xhttp-11443 hcr-server sshd-bhttp checkuser"
 
 for sn in $CRITICAL_SVCS; do
     # Ignora servicos nao instalados
@@ -15,6 +15,13 @@ for sn in $CRITICAL_SVCS; do
         echo "$(date '+%Y-%m-%d %H:%M:%S') REINICIANDO $sn" >> "$LOG"
         systemctl restart "$sn" >/dev/null 2>&1 || true
     fi
+done
+
+
+# Garante que as portas avulsas nao voltem: a unica entrada publica e a 80.
+for sn in vpnproxy-hcr-tcp vpnproxy-hcr-quic vpnproxy-bhttp-18083 vpnproxy-port80 hcr-dispatcher nginx; do
+    systemctl stop "$sn" >/dev/null 2>&1 || true
+    systemctl disable "$sn" >/dev/null 2>&1 || true
 done
 
 # Limpa log antigo (>7 dias)

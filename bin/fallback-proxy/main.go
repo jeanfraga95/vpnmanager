@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"io"
 	"log"
 	"net"
@@ -31,6 +32,10 @@ func detectProtocol(client net.Conn) (string, io.Reader, error) {
 		return hcrTarget, client, nil
 	}
 	peekBuf = append(peekBuf, b)
+
+	// DEBUG: capturar primeiros bytes do probe
+	more, _ := reader.Peek(60)
+	log.Printf("fallback-proxy DEBUG primeiros bytes de %s: %s | texto: %q", client.RemoteAddr(), hex.EncodeToString(more), string(more))
 
 	first := b
 
@@ -143,7 +148,7 @@ func handleConn(client net.Conn) {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
-	listener, err := net.Listen("tcp", "0.0.0.0:19080")
+	listener, err := net.Listen("tcp", "127.0.0.1:19080")
 	if err != nil {
 		log.Fatalf("fallback-proxy: erro escutando na porta 19080: %v", err)
 	}

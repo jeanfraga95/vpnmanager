@@ -1414,6 +1414,13 @@ func handleConn(c net.Conn, dest string, fallback string) {
 				c = &prefixConn{Conn: c, prefix: append([]byte(nil), one...)}
 			} else {
 				hdr := append(one, rest...)
+				// HCR plain: Operation 1-6, Version 0x01. Nao e frame BHTTP:
+				// encaminha para o fallback, que roteia ao hcr-server (18082).
+				if hdr[0] >= 1 && hdr[0] <= 6 && hdr[1] == 0x01 {
+					log.Printf("CONN %s: HCR plain op=%d detectado, fallback HCR", c.RemoteAddr(), hdr[0])
+					pipeFallback(c, fallback, hdr)
+					return
+				}
 				typ := hdr[0]
 				if typ > frameResume {
 					pipeFallback(c, fallback, hdr)

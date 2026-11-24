@@ -376,15 +376,12 @@ step_port80_stack(){
     if [[ -f "$INSTALL_DIR/modules/port80_stack.sh" ]]; then
         bash "$INSTALL_DIR/modules/port80_stack.sh" >/dev/null 2>&1 || true
     fi
-    # HCR TCP + QUIC na porta 8443 (se binarios disponiveis)
-    if [[ -x "$INSTALL_DIR/bin/hcr-quic-proxy/hcr-quic-proxy" && -f /etc/systemd/system/vpnproxy-hcr-quic.service ]]; then
-        systemctl enable vpnproxy-hcr-quic >/dev/null 2>&1 || true
-        systemctl restart vpnproxy-hcr-quic >/dev/null 2>&1 || true
-    fi
-    if [[ -x "$INSTALL_DIR/bin/hcr-tcp-proxy/hcr-tcp-proxy" && -f /etc/systemd/system/vpnproxy-hcr-tcp.service ]]; then
-        systemctl enable vpnproxy-hcr-tcp >/dev/null 2>&1 || true
-        systemctl restart vpnproxy-hcr-tcp >/dev/null 2>&1 || true
-    fi
+    # Nenhuma porta avulsa: HCR e XHTTP ficam em loopback e o HCR
+    # chega pela 80 via fallback interno. nginx tambem nao e usado.
+    for sn in vpnproxy-hcr-tcp vpnproxy-hcr-quic vpnproxy-bhttp-18083 vpnproxy-port80 hcr-dispatcher nginx; do
+        systemctl stop "$sn" >/dev/null 2>&1 || true
+        systemctl disable "$sn" >/dev/null 2>&1 || true
+    done
     return 0
 }
 
