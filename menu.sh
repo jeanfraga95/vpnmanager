@@ -38,31 +38,35 @@ done
 require_root
 
 # ── Cores ─────────────────────────────────────────────────────
-C_BOLD="\033[1m"
-C_DIM="\033[2m"
-C_ORANGE="\033[38;5;208m"
-C_GRAY="\033[38;5;245m"
-C_BLUE="\033[1;34m"
-C_LIGHTGREEN="\033[38;5;120m"
-C_LIGHTRED="\033[38;5;209m"
-C_LIGHTCYAN="\033[1;36m"
-C_WHITE="\033[1;37m"
-C_NC="\033[0m"
+# Paleta unificada em modules/theme.sh: azul escuro + laranja.
 
 # ── Dimensoes responsivas ────────────────────────────────────
 _get_tw(){ tput cols 2>/dev/null || echo 80; }
 
+# Controle de linhas para atualizar somente a faixa de CPU/RAM.
+UI_ROW=1
+CPU_ROW=5
+CPU_LINES=1
+MENU_TW=""
+PROMPT_ROW=1
+PROMPT_COL=8
+STATUS_TOP_ROW=8
+S_IP=""
+S_USERS=0
+S_ONLINE=0            # usuários SSH online
+S_XRAY_ONLINE=0       # usuários Xray/VLESS online
+S_S1="off"; S_S2="off"; S_S3="off"; S_S4="off"; S_S5="off"
+BOX_INNER=56
+BOX_W=58
+
 _recalc_dims(){
     local tw; tw=$(_get_tw)
-    if (( tw < 50 )); then
-        BOX_W=$((tw))
-    elif (( tw < 70 )); then
-        BOX_W=$((tw - 2))
-    else
-        BOX_W=74
+    BOX_INNER=$((tw - 3))
+    (( BOX_INNER > 56 )) && BOX_INNER=56
+    if (( BOX_INNER < 34 )); then
+        if (( tw - 2 >= 28 )); then BOX_INNER=$((tw - 2)); else BOX_INNER=28; fi
     fi
-    (( BOX_W < 36 )) && BOX_W=36
-    BOX_INNER=$((BOX_W - 2))
+    BOX_W=$((BOX_INNER + 2))
 }
 
 _center_pad(){
@@ -72,63 +76,102 @@ _center_pad(){
     printf '%*s' "$pad" ""
 }
 
+_strip_ansi(){
+    printf '%s' "$1" | sed -E 's/\x1B\[[0-9;]*[a-zA-Z]//g; s/\\033\[[0-9;]*[a-zA-Z]//g'
+}
+
 _vlen(){
-    printf '%s' "$1" | tr -d $'\033' | sed 's/\[[0-9;]*m//g' | wc -m | tr -d ' '
+    _strip_ansi "$1" | wc -m | tr -d ' '
 }
 
-# ── Desenho ───────────────────────────────────────────────────
+_trunc_content(){
+    local s="$1" max="$2" plain
+    plain=$(_strip_ansi "$s")
+    if (( ${#plain} > max )); then
+        printf '%s...' "${plain:0:max-3}"
+    else
+        printf '%s' "$s"
+    fi
+}
 
-_sep_line(){
-    local tw; tw=$(_get_tw)
-    local w=$((BOX_INNER + 2))
-    (( w > tw )) && w=$((tw - 2))
-    (( w < 10 )) && w=10
+# ── Desenho: caixas ASCII estilo SSHPlus ─────────────────────
+
+_box_rule(){
+    local fill
+    fill=$(printf '%*s' "$BOX_INNER" "" | tr ' ' '-')
     _center_pad
-    printf "${C_ORANGE}"
-    printf '%0.s─' $(seq 1 "$w")
-    printf "${C_NC}\n"
+    printf '%b+%s+%b\033[K\n' "${C_BORDER}" "$fill" "${C_NC}"
+    ((UI_ROW++))
 }
+
+_sep_line(){ _box_rule; }
+_box_top(){ _box_rule; }
+_box_bottom(){ _box_rule; }
+_box_sep(){ _box_rule; }
 
 _box_line(){
     local content="$1" align="${2:-left}"
-    local vlen=$(_vlen "$content")
+    local len lp rp pad
+    content=$(_trunc_content "$content" "$BOX_INNER")
+    len=$(_vlen "$content")
+    pad=$((BOX_INNER - len))
+    (( pad < 0 )) && pad=0
     _center_pad
+    printf '%b' "${C_BORDER}|${C_NC}"
     if [[ "$align" == "center" ]]; then
-        local total=$((BOX_INNER))
-        local lp=$(( (total - vlen) / 2 ))
-        local rp=$(( total - vlen - lp ))
-        (( lp < 0 )) && lp=0
-        (( rp < 0 )) && rp=0
-        printf "%*s%b%*s" "$lp" "" "$content" "$rp" ""
+        lp=$(( pad / 2 ))
+        rp=$(( pad - lp ))
+        printf '%*s' "$lp" ""
+        printf '%b' "$content"
+        printf '%*s' "$rp" ""
     else
-        printf " %b" "$content"
+        printf '%b' "$content"
+        printf '%*s' "$pad" ""
     fi
-    echo
+    printf '%b\033[K\n' "${C_BORDER}|${C_NC}"
+    ((UI_ROW++))
 }
 
-_box_sep(){ _sep_line; }
-_box_top(){ _sep_line; }
-_box_bottom(){ _sep_line; }
+# Barra de titulo com fundo azul cheio, como no SSHPlus.
+_box_bar(){
+    local text="$1" plain len lp rp
+    plain=$(_strip_ansi "$text")
+    text="$plain"
+    len=${#plain}
+    lp=$(( (BOX_INNER - len) / 2 ))
+    rp=$(( BOX_INNER - len - lp ))
+    (( lp < 0 )) && lp=0
+    (( rp < 0 )) && rp=0
+    _center_pad
+    # A cor do texto é aplicada aqui e só é resetada no fim da linha:
+    # assim o fundo azul da barra fica contínuo e o texto centralizado.
+    printf '%b' "${C_BORDER}|${C_NC}${C_BAR}"
+    printf '%*s' "$lp" ""
+    printf '%b' "${C_WHITE}${text}"
+    printf '%*s' "$rp" ""
+    printf '%b\033[K\n' "${C_NC}${C_BORDER}|${C_NC}"
+    ((UI_ROW++))
+}
 
 _status_icon(){
     case "$1" in
-        active)  echo -e "${C_LIGHTGREEN}●${C_NC}" ;;
-        stopped) echo -e "${C_LIGHTRED}●${C_NC}" ;;
-        off)     echo -e "${C_DIM}○${C_NC}" ;;
+        active)  printf '%b' "${C_LIGHTGREEN}ON${C_NC}" ;;
+        stopped) printf '%b' "${C_YELLOW}PARADO${C_NC}" ;;
+        off)     printf '%b' "${C_DIM}OFF${C_NC}" ;;
     esac
 }
 
 _progress_bar(){
-    local pct=$1 w=$2
+    local pct=$1 w=$2 i
     w=${w:-10}
     (( w < 6 )) && w=6
     local filled=$(( pct * w / 100 ))
     local empty=$(( w - filled ))
-    printf "${C_ORANGE}["
-    printf '%0.s█' $(seq 1 "$filled" 2>/dev/null) || true
-    printf "${C_GRAY}"
-    printf '%0.s░' $(seq 1 "$empty" 2>/dev/null) || true
-    printf "${C_ORANGE}]${C_NC} %3d%%" "$pct"
+    printf '%b' "${C_ORANGE}[${C_LIGHTGREEN}"
+    for ((i=0; i<filled; i++)); do printf '#'; done
+    printf '%b' "${C_GRAY}"
+    for ((i=0; i<empty; i++)); do printf '-'; done
+    printf '%b %3d%%' "${C_ORANGE}]${C_NC}" "$pct"
 }
 
 _get_cpu_usage(){
@@ -170,65 +213,78 @@ _get_svc(){ _cache_services; echo "$_SVC_CACHE" | cut -d'|' -f"$1"; }
 _draw_cpu_ram_line(){
     local cpu=$1 mem=$2
     local tw; tw=$(_get_tw)
+    local pw=10
+    (( tw < 80 )) && pw=6
+
+    CPU_ROW=$UI_ROW
     if (( tw >= 60 )); then
-        local pw=10
-        (( tw < 80 )) && pw=6
-        _box_line "  ${C_BLUE}CPU:${C_NC} $(_progress_bar $cpu $pw)   ${C_BLUE}RAM:${C_NC} $(_progress_bar $mem $pw)"
+        CPU_LINES=1
+        _box_line " ${C_WHITE}CPU:${C_NC} $(_progress_bar $cpu $pw)  ${C_WHITE}RAM:${C_NC} $(_progress_bar $mem $pw)"
     else
-        _box_line "  ${C_BLUE}CPU:${C_NC} $(_progress_bar $cpu 6)"
-        _box_line "  ${C_BLUE}RAM:${C_NC} $(_progress_bar $mem 6)"
+        CPU_LINES=2
+        _box_line " ${C_WHITE}CPU:${C_NC} $(_progress_bar $cpu $pw)"
+        _box_line " ${C_WHITE}RAM:${C_NC} $(_progress_bar $mem $pw)"
     fi
 }
 
-_update_cpu_ram_only(){
-    local cpu=$(_get_cpu_usage)
-    local mem=$(_get_mem_usage)
-    local ip=$(get_ip)
-    local users=$(awk -F: '$3>=1000 && $7=="/bin/false"' /etc/passwd | wc -l)
-    local online=0
-    local vpn_users; mapfile -t vpn_users < <(awk -F: '$3>=1000 && $7=="/bin/false"{print $1}' /etc/passwd)
-    if [[ ${#vpn_users[@]} -gt 0 ]]; then
-        local au; au=$'\n'"$(ps -eo user= | sort -u)"$'\n'
-        for u in "${vpn_users[@]}"; do [[ "$au" == *$'\n'"$u"$'\n'* ]] && (( online++ )); done
-    fi
-    local s1=$(_get_svc 1) s2=$(_get_svc 2) s3=$(_get_svc 3) s4=$(_get_svc 4) s5=$(_get_svc 5)
+# Posição onde o prompt "Opcao:" é desenhado.
+_menu_prompt_pos(){
     local tw; tw=$(_get_tw)
-    local box_w=74; (( tw < 50 )) && box_w=$((tw)); (( tw >= 50 && tw < 70 )) && box_w=$((tw - 2))
-    local box_inner=$((box_w - 2)); local sep_w=$((box_inner + 2)); (( sep_w < 10 )) && sep_w=10
-    local pad=$(( (tw - box_w) / 2 )); (( pad < 0 )) && pad=0
-    local pw=10; (( tw < 80 )) && pw=6; (( tw < 60 )) && pw=6
+    local pad=$(( (tw - BOX_W) / 2 ))
+    (( pad < 0 )) && pad=0
+    PROMPT_ROW=$UI_ROW
+    PROMPT_COL=$(( pad + 8 ))
+}
 
-    printf "\033[2J\033[H"
+# Caixa de status: desenhada no início e reescrita no mesmo lugar nas atualizações.
+# Assim a linha de CPU/RAM nunca fica duplicada.
+_draw_status_box(){
+    local cpu=$1 mem=$2
+    local tw; tw=$(_get_tw)
+    local total_online=$((S_ONLINE + S_XRAY_ONLINE))
 
-    echo
-    printf '%*s' "$pad" ""
-    printf "${C_ORANGE}"; printf '%0.s─' $(seq 1 "$sep_w"); printf "${C_NC}\n"
-    printf '%*s' "$pad" ""
-    printf "  ${C_LIGHTCYAN}${C_BOLD}VPNManager${C_NC} ${C_DIM}v2.0${C_NC}\n"
-    printf '%*s' "$pad" ""
-    printf "${C_ORANGE}"; printf '%0.s─' $(seq 1 "$sep_w"); printf "${C_NC}\n"
-
-    printf '%*s' "$pad" ""
-    printf "  ${C_BLUE}CPU:${C_NC} %b   ${C_BLUE}RAM:${C_NC} %b\n" "$(_progress_bar $cpu $pw)" "$(_progress_bar $mem $pw)"
-
-    printf '%*s' "$pad" ""
+    _box_top
     if (( tw >= 65 )); then
-        printf "  ${C_BLUE}IP:${C_NC} ${C_WHITE}${ip}${C_NC}  ${C_BLUE}Users:${C_NC} ${C_WHITE}${users}${C_NC}  ${C_BLUE}Online:${C_NC} ${C_WHITE}${online}${C_NC}\n"
+        _box_line " ${C_WHITE}IP:${C_NC} ${C_LIGHTCYAN}${S_IP}${C_NC}  ${C_WHITE}Users:${C_NC} ${C_LIGHTCYAN}${S_USERS}${C_NC}  ${C_WHITE}Online:${C_NC} ${C_LIGHTCYAN}${total_online}${C_NC}"
     elif (( tw >= 48 )); then
-        printf "  ${C_BLUE}IP:${C_NC} ${C_WHITE}${ip}${C_NC}\n"
-        printf '%*s' "$pad" ""
-        printf "  ${C_BLUE}Users:${C_NC} ${C_WHITE}${users}${C_NC}  ${C_BLUE}Online:${C_NC} ${C_WHITE}${online}${C_NC}\n"
+        _box_line " ${C_WHITE}IP:${C_NC} ${C_LIGHTCYAN}${S_IP}${C_NC}"
+        _box_line " ${C_WHITE}Users:${C_NC} ${C_LIGHTCYAN}${S_USERS}${C_NC}  ${C_WHITE}Online:${C_NC} ${C_LIGHTCYAN}${total_online}${C_NC}"
     else
-        printf "  ${C_BLUE}${ip}${C_NC}  U:${C_WHITE}${users}${C_NC}  O:${C_WHITE}${online}${C_NC}\n"
+        _box_line " ${C_LIGHTCYAN}${S_IP}${C_NC}  U:${C_LIGHTCYAN}${S_USERS}${C_NC}  O:${C_LIGHTCYAN}${total_online}${C_NC}"
     fi
 
-    printf '%*s' "$pad" ""
-    printf "  $(_status_icon $s1) ${C_BLUE}Xray${C_NC}  $(_status_icon $s2) ${C_BLUE}V2Ray${C_NC}  $(_status_icon $s3) ${C_BLUE}Bot${C_NC}  $(_status_icon $s4) ${C_BLUE}CU${C_NC}  $(_status_icon $s5) ${C_BLUE}Squid${C_NC}\n"
+    _draw_cpu_ram_line "$cpu" "$mem"
 
-    printf '%*s' "$pad" ""
-    printf "${C_ORANGE}"; printf '%0.s─' $(seq 1 "$sep_w"); printf "${C_NC}\n"
+    if (( tw >= 65 )); then
+        _box_line " ${C_WHITE}Xray:${C_NC} $(_status_icon "$S_S1")  ${C_WHITE}V2Ray:${C_NC} $(_status_icon "$S_S2")  ${C_WHITE}Bot:${C_NC} $(_status_icon "$S_S3")  ${C_WHITE}CU:${C_NC} $(_status_icon "$S_S4")  ${C_WHITE}Squid:${C_NC} $(_status_icon "$S_S5")"
+    elif (( tw >= 48 )); then
+        _box_line " ${C_WHITE}Xray:${C_NC} $(_status_icon "$S_S1")  ${C_WHITE}V2Ray:${C_NC} $(_status_icon "$S_S2")  ${C_WHITE}Bot:${C_NC} $(_status_icon "$S_S3")"
+        _box_line " ${C_WHITE}CU:${C_NC} $(_status_icon "$S_S4")  ${C_WHITE}Squid:${C_NC} $(_status_icon "$S_S5")"
+    else
+        _box_line " ${C_WHITE}X:${C_NC} $(_status_icon "$S_S1")  ${C_WHITE}V:${C_NC} $(_status_icon "$S_S2")  ${C_WHITE}B:${C_NC} $(_status_icon "$S_S3")"
+        _box_line " ${C_WHITE}C:${C_NC} $(_status_icon "$S_S4")  ${C_WHITE}S:${C_NC} $(_status_icon "$S_S5")"
+    fi
+    _box_top
+}
 
-    _draw_menu_items
+# Atualiza somente a caixa de status, sem tocar no menu.
+# Usa posicionamento absoluto e nunca roda enquanto há caracteres digitados.
+_update_cpu_ram_only(){
+    local tw; tw=$(_get_tw)
+    if [[ -n "$MENU_TW" && "$tw" != "$MENU_TW" ]]; then
+        draw_header_full
+        _draw_menu_items
+        _menu_prompt_pos
+        return 0
+    fi
+
+    local saved_row=$UI_ROW
+    printf "\033[%d;1H" "$STATUS_TOP_ROW"
+    # Atualiza também a contagem Xray (uma chamada leve à API local).
+    S_XRAY_ONLINE=$(_xray_online_count)
+    _draw_status_box "$(_get_cpu_usage)" "$(_get_mem_usage)"
+    UI_ROW=$saved_row
+    printf "\033[%d;%dH" "$PROMPT_ROW" "$PROMPT_COL"
 }
 
 # ── Draw header completo ──────────────────────────────────────
@@ -253,49 +309,56 @@ draw_header_full(){
     local tw; tw=$(_get_tw)
 
     clear
+    UI_ROW=1
+    MENU_TW=$tw
+
     echo
+    ((UI_ROW++))
     _box_top
-    _box_line "${C_LIGHTCYAN}${C_BOLD}VPNManager${C_NC} ${C_DIM}v2.0${C_NC}" "center"
-    _box_sep
+    _box_bar "VPNManager"
+    _box_line "${C_WHITE}Proxy + Protocolo integrados${C_NC}" "center"
+    _box_top
+    echo
+    ((UI_ROW++))
 
-    _draw_cpu_ram_line "$cpu" "$mem"
-
-    # IP / Users / Online — responsivo
-    if (( tw >= 65 )); then
-        _box_line "  ${C_BLUE}IP:${C_NC} ${C_WHITE}${ip}${C_NC}  ${C_BLUE}Users:${C_NC} ${C_WHITE}${users}${C_NC}  ${C_BLUE}Online:${C_NC} ${C_WHITE}${online}${C_NC}"
-    elif (( tw >= 48 )); then
-        _box_line "  ${C_BLUE}IP:${C_NC} ${C_WHITE}${ip}${C_NC}"
-        _box_line "  ${C_BLUE}Users:${C_NC} ${C_WHITE}${users}${C_NC}  ${C_BLUE}Online:${C_NC} ${C_WHITE}${online}${C_NC}"
-    else
-        _box_line "  ${C_BLUE}${ip}${C_NC}  U:${C_WHITE}${users}${C_NC}  O:${C_WHITE}${online}${C_NC}"
-    fi
-
-    # Status services — responsivo
-    if (( tw >= 65 )); then
-        _box_line "  $(_status_icon $s1) ${C_BLUE}Xray${C_NC}  $(_status_icon $s2) ${C_BLUE}V2Ray${C_NC}  $(_status_icon $s3) ${C_BLUE}Bot${C_NC}  $(_status_icon $s4) ${C_BLUE}CU${C_NC}  $(_status_icon $s5) ${C_BLUE}Squid${C_NC}"
-    elif (( tw >= 48 )); then
-        _box_line "  $(_status_icon $s1)Xray $(_status_icon $s2)V2Ray $(_status_icon $s3)Bot"
-        _box_line "  $(_status_icon $s4)CU $(_status_icon $s5)Squid"
-    else
-        _box_line "  ${C_BLUE}X:${C_NC}$(_status_icon $s1) ${C_BLUE}V:${C_NC}$(_status_icon $s2) ${C_BLUE}B:${C_NC}$(_status_icon $s3)"
-        _box_line "  ${C_BLUE}C:${C_NC}$(_status_icon $s4) ${C_BLUE}S:${C_NC}$(_status_icon $s5)"
-    fi
-
-    _box_sep
+    STATUS_TOP_ROW=$UI_ROW
+    S_IP="$ip"
+    S_USERS=$users
+    S_ONLINE=$online
+    S_XRAY_ONLINE=$(_xray_online_count)
+    S_S1="$s1"
+    S_S2="$s2"
+    S_S3="$s3"
+    S_S4="$s4"
+    S_S5="$s5"
+    _draw_status_box "$cpu" "$mem"
+    echo
+    ((UI_ROW++))
 }
 
 # ── Menu item ─────────────────────────────────────────────────
 
 _menu_item(){
-    local num=$(printf "%2s" "$1") label="$2" status="${3:-}"
-    local st=""
+    local num=$1 label="$2" status="${3:-}"
+    local st="" line
+
     case "$status" in
-        active)  st=" ${C_LIGHTGREEN}●${C_NC}" ;;
-        stopped) st=" ${C_LIGHTRED}●${C_NC}" ;;
-        off)     st=" ${C_DIM}○${C_NC}" ;;
+        active)  st="  ${C_LIGHTGREEN}ON${C_NC}" ;;
+        stopped) st="  ${C_YELLOW}PARADO${C_NC}" ;;
+        off)     st="  ${C_DIM}OFF${C_NC}" ;;
     esac
-    _center_pad
-    echo -e "  ${C_ORANGE}${C_BOLD}${num})${C_NC} ${C_WHITE}${label}${C_NC}${st}"
+    printf -v st '%b' "$st"
+
+    if [[ "$status" == "danger" ]]; then
+        line="${C_LIGHTRED}  [${num}] ${label}${C_NC}"
+    else
+        line="${C_WHITE}  [${C_ORANGE}${num}${C_WHITE}] ${C_LIGHTCYAN}${label}${C_NC}${st}"
+    fi
+    _box_line "$line"
+}
+
+_menu_section(){
+    _box_line " ${C_ORANGE}${C_BOLD}$1${C_NC}" "center"
 }
 
 # ── Xray install prompt ───────────────────────────────────────
@@ -343,9 +406,9 @@ auto_menu_toggle_screen(){
     _box_sep
     echo
     if auto_menu_is_enabled; then
-        _center_pad; echo -e "  ${C_LIGHTGREEN}● ATIVO${C_NC}  ${C_DIM}O menu abre automaticamente${C_NC}"
+        _box_line " ${C_LIGHTGREEN}ATIVO${C_NC}  ${C_DIM}O menu abre automaticamente${C_NC}"
     else
-        _center_pad; echo -e "  ${C_LIGHTRED}● PARADO${C_NC}  ${C_DIM}Execute 'menuvpn' manualmente${C_NC}"
+        _box_line " ${C_LIGHTRED}PARADO${C_NC}  ${C_DIM}Execute 'menuvpn' manualmente${C_NC}"
     fi
     echo
     _center_pad; read -p "  Ativar/Desativar? [s/N]: " resp
@@ -361,7 +424,7 @@ auto_menu_toggle_screen(){
 full_uninstall(){
     clear
     _sep_line
-    echo -e "  ⚠  ${L_UNINST_TITLE}"
+    echo -e "  !  ${L_UNINST_TITLE}"
     _sep_line
     echo
     echo " ${L_UNINST_MSG}"
@@ -412,27 +475,33 @@ full_uninstall(){
 
 _draw_menu_items(){
     _cache_services
+
+    _box_top
+    _box_line "${C_CYAN}${C_BOLD}MENU INICIAL${C_NC}" "center"
+    _box_top
+
     _menu_item 1 "${L_SSH_USERS}"
     _menu_item 2 "${L_ONLINE_USERS}"
     _menu_item 3 "Xray" "$(_get_svc 1)"
     _menu_item 4 "V2Ray" "$(_get_svc 2)"
-    _menu_item 5 "SlowDNS" "$([[ "$(slowdns_is_installed 2>/dev/null)" == "1" ]] && echo "active" || echo "off")"
-    _menu_item 6 "BadVPN" "$([[ "$(badvpn_is_installed 2>/dev/null)" == "1" ]] && echo "active" || echo "off")"
+    _menu_item 5 "SlowDNS" "$(slowdns_is_installed 2>/dev/null && echo active || echo off)"
+    _menu_item 6 "BadVPN" "$(badvpn_is_installed 2>/dev/null && echo active || echo off)"
     _menu_item 7 "Bot Telegram" "$(_get_svc 3)"
     _menu_item 8 "${L_SYSINFO}"
     _menu_item 9 "${L_OPEN_PORT}"
-    _menu_item 10 "${L_BHTTP}" "$([[ "$(bhttp_is_installed 2>/dev/null)" ]] && echo "active" || echo "off")"
-    _menu_item 11 "${L_LIMITER}" "$([[ "$(limiter_is_installed 2>/dev/null)" && "$(limiter_is_active 2>/dev/null)" ]] && echo "active" || { [[ "$(limiter_is_installed 2>/dev/null)" ]] && echo "stopped" || echo "off"; })"
-    _menu_item 12 "${L_BANNER}" "$([[ "$(banner_is_configured 2>/dev/null)" && "$(_banner_is_active_in_sshd 2>/dev/null)" ]] && echo "active" || echo "off")"
+    _menu_item 10 "${L_BHTTP}" "$(bhttp_is_installed 2>/dev/null && echo active || echo off)"
+    _menu_item 11 "${L_LIMITER}" "$(if limiter_is_installed 2>/dev/null; then limiter_is_active 2>/dev/null && echo active || echo stopped; else echo off; fi)"
+    _menu_item 12 "${L_BANNER}" "$(if banner_is_configured 2>/dev/null && _banner_is_active_in_sshd 2>/dev/null; then echo active; else echo off; fi)"
     _menu_item 13 "${L_OTHER_OPT}"
-    _menu_item 14 "${L_AUTO_MENU}" "$([[ "$(auto_menu_is_enabled)" ]] && echo "active" || echo "off")"
+    _menu_item 14 "${L_AUTO_MENU}" "$(auto_menu_is_enabled 2>/dev/null && echo active || echo off)"
     _menu_item 15 "${L_LANGUAGE}"
-    echo
     _menu_item 16 "${L_UNINSTALL}" "danger"
+
+    _box_top
+    _menu_item 0 "${L_EXIT}" "danger"
+    _box_top
     echo
-    _box_sep
-    _box_line "  ${C_DIM}0) ${L_EXIT}${C_NC}" "center"
-    _box_bottom
+    ((UI_ROW++))
 }
 
 # ── Menu Principal ────────────────────────────────────────────
@@ -445,20 +514,45 @@ main_menu(){
         draw_header_full
         _draw_menu_items
 
+        _menu_prompt_pos
         while true; do
+            local input="" ch rc
             printf "\r\033[K"
             _center_pad
-            echo -ne "  ${C_ORANGE}❯${C_NC} ${C_WHITE}"
+            printf '%b' "${C_WHITE}Opcao: ${C_NC}"
 
-            read -t 2 opt 2>/dev/null
-            local rc=$?
+            while true; do
+                # Com caracteres digitados, não há timeout: CPU/RAM não mexe no cursor.
+                if [[ -n "$input" ]]; then
+                    IFS= read -r -n 1 ch
+                else
+                    IFS= read -r -n 1 -t 2 ch
+                fi
+                rc=$?
 
-            if (( rc != 0 )); then
-                _update_cpu_ram_only
-                continue
-            fi
+                if (( rc != 0 )); then
+                    # Timeout com prompt vazio: atualiza apenas CPU/RAM.
+                    _update_cpu_ram_only
+                    continue
+                fi
 
-            echo -e "${C_NC}"
+                if [[ -z "$ch" ]]; then
+                    # Enter.
+                    opt=$input
+                    break
+                fi
+
+                case "$ch" in
+                    $'\177'|$'\b')
+                        [[ -n "$input" ]] && { input=${input%?}; printf '\b \b'; }
+                        ;;
+                    *)
+                        input+="$ch"
+                        ;;
+                esac
+            done
+
+            printf '%b\n' "$C_NC"
             _SVC_CACHE_TIME=0
 
             case "$opt" in

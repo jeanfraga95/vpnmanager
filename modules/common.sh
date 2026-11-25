@@ -7,8 +7,8 @@ INSTALL_DIR="${INSTALL_DIR:-/etc/VPNManager}"
 CONF="$INSTALL_DIR/conf/vpnmanager.conf"
 CRED_FILE="$INSTALL_DIR/conf/xray_credentials.txt"
 
-C_GREEN="\033[1;32m"; C_RED="\033[1;31m"; C_YELLOW="\033[1;33m"
-C_CYAN="\033[1;36m"; C_WHITE="\033[1;37m"; C_NC="\033[0m"
+# Tema unificado: fundo padrão do terminal, cor só nos elementos do menu.
+source "$INSTALL_DIR/modules/theme.sh" 2>/dev/null || true
 
 msg(){ echo -e "${C_CYAN}[*]${C_NC} $1"; }
 ok(){ echo -e "${C_GREEN}[OK]${C_NC} $1"; }

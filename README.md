@@ -9,6 +9,61 @@ cd vpnmanager-lite<br>
 ./install.sh<br>
 menuvpn<br>
 
+## Interface do menu (25/11/2026)
+
+O `menuvpn` segue o padrão visual do VTProxy/SSHPlus:
+
+- caixas ASCII `+----+` com bordas azuis, barra de título azul cheia e
+  `MENU INICIAL` centralizado;
+- opções `[n]` com status `ON/OFF/PARADO`; desinstalar e sair em vermelho;
+- o fundo do terminal permanece o padrão — a cor só é aplicada aos elementos
+  do menu (`modules/theme.sh`);
+- `CPU/RAM` é reescrito no mesmo lugar a cada 2s, sem `clear` e sem duplicar
+  linhas; enquanto uma opção está sendo digitada, a atualização é suspensa;
+- os status são derivados do `exit status` das funções
+  (`slowdns_is_installed`, `badvpn_is_installed`, `bhttp_is_installed`,
+  `auto_menu_is_enabled`, etc.), pois elas retornam `0` sem imprimir nada;
+- a contagem `Online:` do painel inicial soma usuários SSH + Xray/VLESS.
+
+### Usuários online no Xray
+
+A opção **2) Usuários Online** mostra usuário, IP(s) e quantidade de sessões
+do Xray. Para isso, `/usr/local/etc/xray/config.json` expõe a API local:
+
+```json
+{
+  "api": {
+    "tag": "api",
+    "listen": "127.0.0.1:8099",
+    "services": ["StatsService", "HandlerService", "LoggerService"]
+  },
+  "stats": {},
+  "policy": {
+    "levels": { "0": { "statsUserOnline": true } }
+  }
+}
+```
+
+Sem `policy.levels.0.statsUserOnline`, `statsgetallonlineusers` retorna `{}`
+mesmo com conexões ativas. Consultas usadas pelo menu:
+
+```
+xray api statsgetallonlineusers --server=127.0.0.1:8099
+xray api statsonline --server=127.0.0.1:8099 -email <usuario>
+xray api statsonlineiplist --server=127.0.0.1:8099 -email <usuario>
+```
+
+O V2Ray não está instalado nesta VPS; se for instalado, basta expor a API
+equivalente e estender `_xray_online_count` / `_xray_online_list` em
+`modules/online_users.sh`.
+
+Arquivos da UI: `menu.sh`, `modules/theme.sh`, `modules/online_users.sh`,
+`modules/common.sh`.
+
+Rollbacks no VPS: `/root/rollback_vpnmanager_ui_v5.sh`,
+`/root/rollback_online_users_xray.sh`, `/root/rollback_xray_online.sh`,
+`/root/rollback_xray_api.sh`.
+
 ## Estado atual — 24/11/2026 (stack limpa, sem nginx)
 
 O proxy em produção é o binário **patched/híbrido**:

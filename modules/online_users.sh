@@ -6,6 +6,49 @@ source "$INSTALL_DIR/modules/common.sh"
 
 PM_DB="/root/pm_users.db"
 
+# API local do Xray (ativa em /usr/local/etc/xray/config.json).
+XRAY_API="127.0.0.1:8099"
+
+_xray_api(){
+    command -v xray >/dev/null 2>&1 || return 1
+    xray api "$@" --server="$XRAY_API" 2>/dev/null
+}
+
+# Quantidade de usuários Xray/VLESS online (uma única chamada à API).
+_xray_online_count(){
+    local n
+    n=$(_xray_api statsgetallonlineusers \
+        | jq -r '.users | length // 0' 2>/dev/null) || n=0
+    [[ "$n" =~ ^[0-9]+$ ]] || n=0
+    printf '%s' "$n"
+}
+
+# Usuários Xray/VLESS online: nome|IPs|sessões.
+_xray_online_list(){
+    local names u sess ips
+    names=$(_xray_api statsgetallonlineusers \
+        | jq -r '.users[]? | sub("^user>>>"; "") | sub(">>>online$"; "")' 2>/dev/null) || return 0
+    [[ -z "$names" ]] && return 0
+
+    while IFS= read -r u; do
+        [[ -z "$u" ]] && continue
+        sess=$(_xray_api statsonline -email "$u" | jq -r '.stat.value // 0' 2>/dev/null)
+        ips=$(_xray_api statsonlineiplist -email "$u" | jq -r '.ips | keys | join(",")' 2>/dev/null)
+        [[ -z "$sess" ]] && sess=0
+        [[ -z "$ips" ]] && ips="-"
+        printf '%s|%s|%s\n' "$u" "$ips" "$sess"
+    done <<< "$names"
+}
+
+_short_ips(){
+    local ips="$1" max="${2:-26}"
+    if (( ${#ips} > max )); then
+        printf '%s...' "${ips:0:max-3}"
+    else
+        printf '%s' "$ips"
+    fi
+}
+
 # conta processos sshd do usuário (o mesmo que aparece filtrando "sshd" no htop)
 _count_procs(){ pgrep -u "$1" -x sshd 2>/dev/null | wc -l | tr -d ' '; }
 
@@ -65,6 +108,26 @@ online_users_menu(){
                 printf "  ${C_GREEN}%-18s${C_NC} %5s %6s %-12s %s\n" \
                     "$u" "$procs" "$limit" "$exp" "$ips"
             done
+        fi
+
+        # Usuários online no Xray (VLESS). O V2Ray, quando instalado, usa a mesma API.
+        echo
+        if command -v xray >/dev/null 2>&1 && systemctl is-active --quiet xray; then
+            local xdata; mapfile -t xdata < <(_xray_online_list)
+            local xtotal=${#xdata[@]}
+            echo -e "  ${C_CYAN}Xray/VLESS${C_NC} - ${L_OL_CONNECTED} ${C_GREEN}$xtotal${C_NC}"
+            if (( xtotal > 0 )); then
+                echo
+                printf "  %-20s %-26s %5s\n" \
+                    "${L_OL_HEADER_USER}" "${L_OL_HEADER_IP}" "SESS"
+                echo "  ────────────────────────────────────────────────────────"
+                for row in "${xdata[@]}"; do
+                    IFS='|' read -r u ips sess <<< "$row"
+                    printf "  ${C_GREEN}%-20s${C_NC} %-26s %5s\n" "$u" "$(_short_ips "$ips" 26)" "$sess"
+                done
+            else
+                echo -e "  ${C_YELLOW}${L_OL_NONE}${C_NC}"
+            fi
         fi
 
         echo
