@@ -88,6 +88,9 @@ _proxy_list_ports(){
 
 _proxy_write_service(){
     local tipo="$1" porta="$2" destino="$3"
+    # O binario 'proxy' (WebSocket) responde 101 a cliente silencioso por
+    # padrao (~50ms), equivalente ao --silent-ws do proxy unificado.
+    # Nunca usar --no-immediate-101 nas portas criadas por aqui.
     local bin sn
     bin=$(_proxy_bin "$tipo")
     sn=$(_proxy_svc_name "$tipo" "$porta")

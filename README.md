@@ -86,8 +86,8 @@ O proxy em produção é o binário **patched/híbrido**:
   `--auto-200` volta ao modo antigo (responde `200` imediatamente).
 - Produção 25/11/2026: WS 8080 substituído pelo `vpnproxy-unified-8080` (`101` → `200` imediato); XHTTP real em `11443` (loopback); fallback `19080` removido.
 - **HCR na 80**: o sniff do BHTTP reconhece o cabeçalho HCR plain
-  (`Operation 1-6` + `Version 0x01`, 62 bytes) e encaminha ao fallback, que
-  roteia para `127.0.0.1:18082`. Validado: `HCR plain op=1` → `18082`.
+  (`Operation 1-6` + `Version 0x01`, 62 bytes) e roteia internamente para
+  `127.0.0.1:18082`. Validado: `HCR plain op=1` → `18082`.
 - **`healthcheck.sh`** não religa mais `vpnproxy-hcr-tcp`/`quic` nem nginx;
   pelo contrário, força essas unidades paradas para manter as portas avulsas
   fechadas.
@@ -111,7 +111,7 @@ O proxy em produção é o binário **patched/híbrido**:
 |---|---|
 | 80/tcp + 80/udp | entrada pública unificada (`vpnproxy-unified`): BHTTP/HCR/WS/XHTTP/SSH |
 | 8080/tcp + 8080/udp | entrada pública unificada (`vpnproxy-unified-8080`): BHTTP/HCR/WS/XHTTP/SSH |
-| 19080 | removido; fallback não existe mais |
+| 19080 | removido; o fallback lógico do menu é `127.0.0.1:8080` (ver abaixo) |
 | 18082 / 11443 | backends loopback de HCR e XHTTP |
 | 443 | xray |
 | 18082 | hcr-server (loopback) |
@@ -120,9 +120,28 @@ O proxy em produção é o binário **patched/híbrido**:
 | 22 | sshd |
 
 **Fechadas / não usadas:** `8443` (TCP e UDP), `8787`, `8788`, `9090`,
-`9443`, `18083`. O HCR não tem porta pública: chega pela 80 via BHTTP →
-fallback → `127.0.0.1:18082`. O comando `vpnmanager-stack` mostra o estado da
-stack; para reaplicar: `bash /etc/VPNManager/modules/port80_stack.sh`.
+`9443`, `18083`. O HCR não tem porta pública: chega pela 80 via BHTTP e o
+dispatcher interno encaminha para `127.0.0.1:18082`. O comando
+`vpnmanager-stack` mostra o estado da stack; a stack publica atual deve ser
+reaplicada pelos serviços `vpnproxy-unified` / `vpnproxy-unified-8080` (o
+antigo `port80_stack.sh` é legado e não deve ser usado em produção).
+
+### Opção 10 do menu (BHTTP)
+
+A opção **10) BHTTP** abre portas com o mesmo binário unificado da 80/8080:
+BHTTP, HCR, XHTTP, WebSocket, CONNECT/SOCKS e TLS na **mesma porta**.
+
+- **Não pede mais porta de fallback.** O destino é escolhido em background e
+  gravado em `/etc/VPNManager/conf/bhttp_fallback.conf`.
+- Na primeira execução, reutiliza um `--fallback-target` já existente em
+  serviços BHTTP/unificados; se não houver, usa `127.0.0.1:8080` e garante
+  que `vpnproxy-unified-8080` esteja ativo.
+- Esse valor é sempre reutilizado nas próximas portas abertas.
+- Abrir `80` ou `8080` **nunca** chama o `port80_stack.sh` legado: essas
+  portas usam `vpnproxy-unified.service` e `vpnproxy-unified-8080.service`.
+- **`--silent-ws` em todas as portas**, inclusive a `80`. Cliente que abre a
+  conexão e não envia dados recebe `101` imediato; BHTTP, HCR, XHTTP, WS com
+  dados, CONNECT/SOCKS e decoys continuam no roteamento normal.
 
 ### Opção 9 do menu (`Abrir Porta`)
 
@@ -133,6 +152,11 @@ A opção 9 chama `proxy_menu` e apenas cria
 - subopção **1) WebSocket** → `/etc/VPNManager/bin/proxy` (**proxy novo patched**)
 - subopção **2) TLS/SSL** → `/etc/VPNManager/bin/sslproxy`
 - subopção **3) SSH XHTTP** → `/etc/VPNManager/bin/xhttpssh`
+
+O WebSocket manual já responde `101` para cliente silencioso em ~50ms
+(comportamento equivalente ao `--silent-ws`); as portas criadas aqui nunca
+usam `--no-immediate-101`. TLS/SSL e XHTTP não têm esse conceito e ficam
+inalterados.
 
 Ela não configura o app nem o BHTTP automaticamente e recusa uma porta já
 aberta/em uso (não dá para reabrir a 8080). Para a porta 80, use a opção 10
@@ -260,14 +284,15 @@ WebSocket; no 4G/CGNAT o pacote demorava e o sniff caía no motor BHTTP
 (`sniff nil (timeout sem dados), assume BHTTP`), que não responde nada. O proxy C
 enviava `101` em 50ms nesse caso.
 
-- Nova flag `--silent-ws`, usada **apenas** em `vpnproxy-unified-8080.service`.
+- Nova flag `--silent-ws`, inicialmente usada **apenas** em
+  `vpnproxy-unified-8080.service` (estendida para todas as portas abaixo).
 - Com a flag o sniff cai de 200ms para 50ms. Zero bytes, frame incompleto ou
   qualquer prefixo não identificado vão para o `wsproxy`, que responde
   `HTTP/1.1 101 OK` em ~50ms; o payload seguinte recebe `200 OK` + banner SSH.
 - Regra de roteamento: **BHTTP, HCR e XHTTP** continuam nos seus motores;
   **todo o resto** (WebSocket, CONNECT, SOCKS4/5, TLS bruto, decoys e payloads
   arbitrários) é tratado como WebSocket/SOCKS pelo dispatcher interno.
-- A porta 80 **não** usa a flag: zero bytes continua indo para BHTTP.
+- Naquele momento a porta 80 **não** usava a flag: zero bytes ia para BHTTP.
 - Tradeoff: na 8080, um cliente BHTTP que demore >50ms para enviar o primeiro
   frame receberá o 101 e não falará BHTTP nessa conexão. O app BHTTP normal envia
   imediatamente e segue no motor BHTTP; o app VPN no 4G envia nada e recebe o 101.
@@ -303,8 +328,8 @@ do cliente. O `101` com `Sec-WebSocket-Key` (GET legítimo) permanece com
   `gofmt`.
 - Validação: 11/11 silent + 13/13 em cada porta; cliente externo recebeu o
   `101` completo em 14ms e o `200` + banner em seguida.
-- Deploy: só a unit da 8080 foi reiniciada. A 80 continua com zero bytes →
-  BHTTP.
+- Deploy naquele momento: só a unit da 8080 foi reiniciada. A 80 continuou com
+  zero bytes → BHTTP até a atualização registrada mais abaixo.
 - Rollback: `/root/rollback_ws101hdr.sh`
   (backup `/root/backup_ws101hdr_20261125_151859`).
 
@@ -316,7 +341,7 @@ direto na ponte TCP — sem enviar um `200 OK` extra. Não foi aproveitada a
 simplicidade dele de não filtrar decoys/múltiplos métodos: esse filtro continua
 no `wsproxy` Go.
 
-Agora o ramo `--silent-ws` (usado só na 8080) segue exatamente esse fluxo:
+Agora o ramo `--silent-ws` segue exatamente esse fluxo (na época, só na 8080):
 
 ```
 TCP sem payload -> 101 completo em ~50ms
@@ -325,8 +350,7 @@ GET legítimo com Sec-WebSocket-Key -> 101 Switching Protocols + Accept + 200
 ```
 
 O `200 OK` continua presente em todos os outros caminhos (GET-first, CONNECT,
-SOCKS, XHTTP e BHTTP). A porta 80 não usa `--silent-ws`: zero bytes continua
-indo para BHTTP.
+SOCKS, XHTTP e BHTTP). Naquele momento a porta 80 não usava `--silent-ws`.
 
 - Build reproduzível: `scripts/build_unified.py` reaplica
   `scripts/apply_silent_ws.py` e `scripts/apply_nomagic200.py`, roda `gofmt` e
@@ -336,9 +360,30 @@ indo para BHTTP.
 - Validação: 8/8 no QA específico do silent e 13/13 no QA completo em cada
   porta temporária (18098 sem a flag, 18099 com a flag) e em produção (80 e
   8080). O `ActiveEnterTimestamp` da unit da 80 não mudou no deploy.
-- Deploy: só `vpnproxy-unified-8080.service` foi reiniciado.
+- Deploy naquele momento: só `vpnproxy-unified-8080.service` foi reiniciado.
 - Rollback: `/root/rollback_nomagic200.sh`
   (backup `/root/backup_nomagic200_20261125_153144`).
+
+### `--silent-ws` em todas as portas (25/11/2026, 18:xx UTC)
+
+A pedido, a flag passou a ser aplicada a **todas** as entradas unificadas
+criadas pelo módulo BHTTP, inclusive a porta `80`:
+
+- `vpnproxy-unified.service` (80) recebeu `--silent-ws`;
+- `vpnproxy-unified-8080.service` já tinha a flag;
+- toda porta nova criada pelo menu BHTTP recebe a flag automaticamente.
+
+Comportamento mantido: BHTTP, HCR, XHTTP, WebSocket com payload, CONNECT/SOCKS,
+TLS e filtros de decoys continuam no roteamento normal. A única mudança é o
+cliente que abre TCP e **não envia nenhum byte**: antes na 80 caía no motor
+BHTTP e não respondia; agora recebe o `101` completo em ~50ms.
+
+O proxy manual (opção 9) permanece com `/etc/VPNManager/bin/proxy`: o WebSocket
+já responde `101` para cliente silencioso por padrão e nenhuma unidade criada
+por ali usa `--no-immediate-101`. TLS/SSL e XHTTP não são afetados.
+
+A unit da 80 foi reiniciada para aplicar a flag (queda de alguns segundos nas
+conexões da 80). Rollback específico: `/root/rollback_silent_all.sh`.
 
 ### Rollback temporário para o C e restauração do Go (25/11/2026)
 

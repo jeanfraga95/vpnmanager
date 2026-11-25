@@ -2,31 +2,48 @@
 #============================================================
 # bhttp.sh - Gerenciador de portas BHTTP (Binary HTTP SSH)
 #
-# Usa o binário 'bhttpssh_dtp' para criar túneis SSH via
-# protocolo BHTTP (Binary HTTP) sobre portas que passam
-# por firewalls/CAPTIVE portals (porta 80, etc).
+# Usa o binário 'vpnproxy-unified' para criar entradas publicas que
+# servem BHTTP/HCR/XHTTP/WS/CONNECT/SOCKS/TLS na MESMA porta.
 #
-#   BHTTP : ./bhttpssh_dtp --port <PORTA> --static-target <SSH> [--fallback-target <PROXY>]
+#   vpnproxy-unified --port <PORTA> --static-target <SSH> \
+#     --hcr-target ... --xhttp-target ... --ws-to ...
 #
-# O BHTTP funciona como proxy transparente entre o app
-# (conexão BHTTP) e o sshd local, permitindo túnel SSH
-# mesmo em redes que bloqueiam portas não-padrão.
+# Nao ha prompt de fallback: o destino e escolhido automaticamente,
+# gravado em conf/bhttp_fallback.conf e reutilizado em todas as portas.
+# --silent-ws e aplicado em todas elas (inclusive 80): cliente silencioso
+# recebe 101; BHTTP/HCR/XHTTP/WS com dados seguem o roteamento normal.
 #============================================================
 
 source "$INSTALL_DIR/modules/common.sh"
 
-BHTTP_BIN="$INSTALL_DIR/bin/bhttpssh_dtp"
+BHTTP_BIN="$INSTALL_DIR/bin/bhttpssh_dtp"          # legado (nao usado para abrir portas)
+UNIFIED_BIN="$INSTALL_DIR/bin/vpnproxy-unified"
 BHTTP_SVC_PREFIX="vpnproxy-bhttp"
 BHTTP_SSHD_PORT=2223
 BHTTP_SSHD_CONF="/etc/ssh/sshd_config_bhttp"
+FALLBACK_CONF="$INSTALL_DIR/conf/bhttp_fallback.conf"
+BHTTP_CERT="$INSTALL_DIR/conf/bhttp_80_cert.pem"
+BHTTP_KEY="$INSTALL_DIR/conf/bhttp_80_key.pem"
 
 # ── Helpers ──────────────────────────────────────────────────
 
-bhttp_is_installed(){ [[ -x "$BHTTP_BIN" ]]; }
+bhttp_is_installed(){ [[ -x "$UNIFIED_BIN" ]]; }
 
+# Nome canonico do servico unificado de cada porta.
 _bhttp_svc_name(){
     local porta="$1"
-    echo "${BHTTP_SVC_PREFIX}-${porta}"
+    case "$porta" in
+        80)   echo "vpnproxy-unified" ;;
+        8080) echo "vpnproxy-unified-8080" ;;
+        *)    echo "vpnproxy-unified-${porta}" ;;
+    esac
+}
+
+# Porta a partir do nome do servico unificado.
+_bhttp_port_from_svc(){
+    local sn="$1"
+    [[ "$sn" == "vpnproxy-unified" ]] && { echo "80"; return; }
+    echo "${sn##*-}"
 }
 
 # Normaliza um destino "host:porta": se o usuario digitar apenas
@@ -44,13 +61,102 @@ _bhttp_norm_target(){
     fi
 }
 
-# Lista portas BHTTP abertas: "porta|destino|fallback|status"
+# Descobre um fallback ja existente. Ordem: configuracao salva,
+# servicos unificados ativos, unidades BHTTP legadas, padrao 8080.
+_bhttp_find_fallback(){
+    local cfg target f sn porta_svc
+
+    if [[ -f "$FALLBACK_CONF" ]]; then
+        cfg=$(head -n 1 "$FALLBACK_CONF" | tr -d '[:space:]')
+        cfg="$(_bhttp_norm_target "$cfg")"
+        [[ -n "$cfg" ]] && { echo "$cfg"; return; }
+    fi
+
+    for f in /etc/systemd/system/vpnproxy-unified*.service \
+             /etc/systemd/system/${BHTTP_SVC_PREFIX}-*.service; do
+        [[ -f "$f" ]] || continue
+        target=$(grep -oP -- '--fallback-target[= ]\K[0-9.:]+' "$f" | head -1)
+        [[ -z "$target" ]] && continue
+        sn=$(basename "$f" .service)
+        porta_svc=$(_bhttp_port_from_svc "$sn")
+        # Nunca usa a propria porta como fallback.
+        [[ "$target" == "127.0.0.1:${porta_svc}" ]] && continue
+        target="$(_bhttp_norm_target "$target")"
+        [[ -n "$target" ]] && { echo "$target"; return; }
+    done
+
+    echo "127.0.0.1:8080"
+}
+
+# Garante que o alvo do fallback esteja disponivel, sem perguntar nada.
+_bhttp_ensure_fallback(){
+    local fb fport sn bin
+    fb="$(_bhttp_find_fallback)"
+    fb="$(_bhttp_norm_target "$fb")"
+    [[ -z "$fb" ]] && fb="127.0.0.1:8080"
+
+    mkdir -p "$(dirname "$FALLBACK_CONF")"
+    printf '%s\n' "$fb" > "$FALLBACK_CONF"
+
+    fport="${fb##*:}"
+    if [[ "$fport" == "8080" ]]; then
+        sn="vpnproxy-unified-8080"
+        if [[ ! -f "/etc/systemd/system/${sn}.service" ]]; then
+            _bhttp_write_unified_service 8080 "127.0.0.1:22" ""
+        fi
+        systemctl is-active --quiet "$sn" 2>/dev/null || \
+            systemctl start "$sn" >/dev/null 2>&1 || true
+    elif [[ "$fport" == "19080" ]]; then
+        sn="vpnproxy-fallback"
+        bin="$INSTALL_DIR/bin/fallback-proxy/fallback-proxy"
+        if [[ -x "$bin" && ! -f "/etc/systemd/system/${sn}.service" ]]; then
+            cat > "/etc/systemd/system/${sn}.service" << SVC
+[Unit]
+Description=VPNManager fallback interno 19080 (HCR + WebSocket + XHTTP)
+After=network.target hcr-server.service vpnproxy-xhttp-11443.service
+Wants=hcr-server.service vpnproxy-xhttp-11443.service
+
+[Service]
+Type=simple
+ExecStart=${bin}
+Restart=always
+RestartSec=2s
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target
+SVC
+            systemctl daemon-reload
+            systemctl enable "$sn" >/dev/null 2>&1
+        fi
+        if [[ -f "/etc/systemd/system/${sn}.service" ]]; then
+            systemctl is-active --quiet "$sn" 2>/dev/null || \
+                systemctl start "$sn" >/dev/null 2>&1 || true
+        fi
+    fi
+
+    printf '%s' "$fb"
+}
+
+# Backends internos precisam estar vivos; nunca reinicia os que ja estao.
+_bhttp_ensure_internals(){
+    local svc
+    for svc in sshd-bhttp hcr-server vpnproxy-xhttp-11443; do
+        if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
+            systemctl start "$svc" >/dev/null 2>&1 || true
+        fi
+    done
+}
+
+# Lista portas unificadas abertas: "porta|destino|fallback|status"
 _bhttp_list_ports(){
-    for f in /etc/systemd/system/${BHTTP_SVC_PREFIX}-*.service; do
+    local f
+    for f in /etc/systemd/system/vpnproxy-unified.service \
+             /etc/systemd/system/vpnproxy-unified-*.service; do
         [[ -f "$f" ]] || continue
         local sn porta destino fallback status
         sn=$(basename "$f" .service)
-        porta="${sn##*-}"
+        porta=$(_bhttp_port_from_svc "$sn")
         destino=$(grep -oP -- '--static-target[= ]\K[0-9.:]+' "$f" | head -1)
         fallback=$(grep -oP -- '--fallback-target[= ]\K[0-9.:]+' "$f" | head -1)
         [[ -z "$destino" ]] && destino="127.0.0.1:2223"
@@ -66,20 +172,29 @@ _bhttp_list_ports(){
 
 # ── Escrever servico systemd ─────────────────────────────────
 
-_bhttp_write_service(){
-    local porta="$1" destino="$2" fallback="$3"
-    local bin="$BHTTP_BIN"
+# Baixo nivel: nao descobre fallback (evita recursao ao garantir a 8080).
+# --silent-ws vai em TODAS as portas: cliente sem dados recebe 101 imediato;
+# BHTTP/HCR/XHTTP/WS com dados continuam no roteamento normal.
+_bhttp_write_unified_service(){
+    local porta="$1" destino="$2" fallback="${3:-}"
     local sn; sn=$(_bhttp_svc_name "$porta")
 
-    local exec_cmd="${bin} --port ${porta} --static-target ${destino}"
+    local exec_cmd="${UNIFIED_BIN} --port ${porta} --silent-ws --static-target ${destino}"
     [[ -n "$fallback" && "$fallback" != "-" ]] && exec_cmd="${exec_cmd} --fallback-target ${fallback}"
+    exec_cmd="${exec_cmd} --idle 24h --quic-port ${porta}"
+    exec_cmd="${exec_cmd} --tls-cert ${BHTTP_CERT} --tls-key ${BHTTP_KEY}"
+    exec_cmd="${exec_cmd} --hcr-target 127.0.0.1:18082"
+    exec_cmd="${exec_cmd} --xhttp-target 127.0.0.1:11443"
+    exec_cmd="${exec_cmd} --ws-to 127.0.0.1:22"
 
     cat > "/etc/systemd/system/${sn}.service" << SVC
 [Unit]
-Description=VPNManager BHTTP SSH tunnel port ${porta} -> ${destino}
-After=network.target
+Description=VPNManager unified proxy ${porta} (BHTTP/HCR/WS/XHTTP/SSH) -> ${destino}
+After=network-online.target ssh.service sshd-bhttp.service hcr-server.service vpnproxy-xhttp-11443.service
+Wants=network-online.target ssh.service sshd-bhttp.service
 
 [Service]
+Type=simple
 User=root
 ExecStart=${exec_cmd}
 Restart=always
@@ -91,6 +206,11 @@ WantedBy=multi-user.target
 SVC
     systemctl daemon-reload
     systemctl enable "$sn" >/dev/null 2>&1
+}
+
+_bhttp_write_service(){
+    local porta="$1" destino="$2" fallback="${3:-}"
+    _bhttp_write_unified_service "$porta" "$destino" "$fallback"
 }
 
 # ── Configurar sshd para BHTTP ───────────────────────────────
@@ -145,7 +265,7 @@ SVC
 # ── Abrir porta BHTTP ────────────────────────────────────────
 
 bhttp_open_port(){
-    if [[ ! -x "$BHTTP_BIN" ]]; then
+    if ! bhttp_is_installed; then
         fail "${L_BH_BIN_NOT_FOUND}"
         pause; return
     fi
@@ -155,15 +275,6 @@ bhttp_open_port(){
     if ! [[ "$porta" =~ ^[0-9]+$ ]] || (( porta < 1 || porta > 65535 )); then
         fail "${L_BH_INVALID_PORT}"
         pause; return
-    fi
-
-    if [[ "$porta" == "80" ]]; then
-        echo
-        echo " Configurando stack completa na porta 80 (WebSocket/BHTTP/HCR/XHTTP)..."
-        bash "$INSTALL_DIR/modules/port80_stack.sh"
-        ok "Porta 80 ativa: WebSocket/BHTTP/HCR/XHTTP"
-        pause
-        return
     fi
 
     local sn; sn=$(_bhttp_svc_name "$porta")
@@ -181,19 +292,21 @@ bhttp_open_port(){
     destino="${destino:-127.0.0.1:2223}"
     destino="$(_bhttp_norm_target "$destino")"
 
+    # Fallback e decidido/configurado em background e reutilizado sempre.
     local fallback
-    read -p " ${L_BH_FALLBACK_PROMPT}" fallback
-    fallback="${fallback:-}"
-    fallback="$(_bhttp_norm_target "$fallback")"
+    fallback=$(_bhttp_ensure_fallback)
+    # Nunca aponta a propria porta como fallback (evita loop).
+    [[ "$fallback" == "127.0.0.1:${porta}" ]] && fallback=""
 
     _bhttp_setup_sshd
+    _bhttp_ensure_internals
     _bhttp_write_service "$porta" "$destino" "$fallback"
     systemctl restart "$sn" >/dev/null 2>&1
     sleep 1
 
     if systemctl is-active --quiet "$sn"; then
         ok "${L_BH_PORT_OPENED}${porta} -> ${destino}"
-        [[ -n "$fallback" && "$fallback" != "-" ]] && echo -e "  ${C_DIM}Fallback: ${fallback}${C_NC}"
+        echo -e "  ${C_DIM}Todos os protocolos na mesma porta; fallback automatico: ${fallback:-none}${C_NC}"
     else
         fail "${L_BH_START_FAIL}${sn}"
         echo "  journalctl -u ${sn} -n 20"
@@ -235,6 +348,11 @@ bhttp_close_port(){
     fi
 
     local porta="${plist[$((opt-1))]}"
+    if [[ "$porta" == "80" || "$porta" == "8080" ]]; then
+        fail "Porta ${porta} e canonica; nao pode ser fechada por aqui."
+        pause; return
+    fi
+
     local sn; sn=$(_bhttp_svc_name "$porta")
     systemctl stop "$sn" >/dev/null 2>&1
     systemctl disable "$sn" >/dev/null 2>&1
