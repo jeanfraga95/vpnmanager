@@ -29,7 +29,7 @@ O proxy em produção é o binário **patched/híbrido**:
   `npv-x` (header HTTP ou payload legado) ou o banner `SSH-`. Isso mantém o
   timing do hsproxy sem perder filtro de decoys, DPI, keepalive e timeout 24h.
   `--auto-200` volta ao modo antigo (responde `200` imediatamente).
-- Produção 24/11/2026: WS 8080 rodando com `--auto-200` (`101` → `200` imediato); XHTTP real em `11443` (loopback); fallback em `127.0.0.1:19080`.
+- Produção 25/11/2026: WS 8080 substituído pelo `vpnproxy-unified-8080` (`101` → `200` imediato); XHTTP real em `11443` (loopback); fallback `19080` removido.
 - **HCR na 80**: o sniff do BHTTP reconhece o cabeçalho HCR plain
   (`Operation 1-6` + `Version 0x01`, 62 bytes) e encaminha ao fallback, que
   roteia para `127.0.0.1:18082`. Validado: `HCR plain op=1` → `18082`.
@@ -54,9 +54,10 @@ O proxy em produção é o binário **patched/híbrido**:
 
 | Porta | Serviço |
 |---|---|
-| 80/tcp + 80/udp | **única entrada pública**: BHTTP → fallback `19080` |
-| 19080 | fallback interno (`127.0.0.1`) → `18082` HCR, `8080` WS, `11443` XHTTP |
-| 8080/tcp | proxy CloudJF patched (`vpnproxy-ws-8080`, `--auto-200`) |
+| 80/tcp + 80/udp | entrada pública unificada (`vpnproxy-unified`): BHTTP/HCR/WS/XHTTP/SSH |
+| 8080/tcp + 8080/udp | entrada pública unificada (`vpnproxy-unified-8080`): BHTTP/HCR/WS/XHTTP/SSH |
+| 19080 | removido; fallback não existe mais |
+| 18082 / 11443 | backends loopback de HCR e XHTTP |
 | 443 | xray |
 | 18082 | hcr-server (loopback) |
 | 11443 | xhttpssh (loopback via drop-in systemd) |
@@ -185,10 +186,13 @@ perdiam os bytes lidos antes do timeout).
 
 Rollback: `/root/rollback_unified.sh`. Backup completo:
 `/root/backup_unified_cutover_20261125_140620.tar.gz`.
-A unit `vpnproxy-unified-8080.service` foi preparada, mas **não foi habilitada**;
-a 8080 segue com o proxy C (`vpnproxy-ws-8080`).
+A unit `vpnproxy-unified-8080.service` foi habilitada em 25/11/2026; as units
+`vpnproxy-ws-8080`, `vpnproxy-bhttp-80` e `vpnproxy-fallback` estão inativas e
+desabilitadas. O `healthcheck.sh` agora monitora apenas `vpnproxy-unified`,
+`vpnproxy-unified-8080`, `vpnproxy-xhttp-11443`, `hcr-server`, `sshd-bhttp` e
+`checkuser`, evitando restart-loop e conflito de bind.
 
 Validação: `101 → 200 → banner SSH`, CONNECT e SOCKS5 idênticos ao baseline da
-8080; XHTTP e HCR roteados corretamente; TLS 1.3 com ALPN `bhttp-ssh`; ~98
+80 e 8080; XHTTP e HCR roteados corretamente; TLS 1.3 com ALPN `bhttp-ssh`; ~98
 conexões reais na 80 com `WRITE->SSHD` no log; RSS ~55MB, 138 FDs, 6 threads;
 portas `8443/8787/8788/9090/9443/18082/11443` fechadas externamente.
