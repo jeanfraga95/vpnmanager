@@ -133,3 +133,32 @@ minutos, com apenas 10 slots. O guard foi estendido para os DOIS listeners:
   externamente.
 
 Detalhes do proxy: [`src/proxycloudjf/README.md`](src/proxycloudjf/README.md).
+
+### Estabilidade sem watchdog destrutivo (25/11/2026)
+
+A queda das portas **80/8080** foi rastreada até o cron
+`*/2 * * * * /usr/local/bin/ramwatch.sh`: ao atingir 97% de RAM ele entrava em
+modo "forçado" e reiniciava `ssh`, `sshd`, `squid`, `xray`, `x-ui` e os proxies.
+Isso derrubava as sessões dos usuários mesmo com a stack systemd intacta.
+O log mostrou `RAM=97% >= 90% (forçado)` às 12:04 UTC e o `vpnproxy-bhttp-80`
+reiniciado às 12:12:17 UTC.
+
+- `modules/ram_clean.sh` agora é **100% não destrutivo**: libera apenas page
+  cache e registra alerta; nunca reinicia serviços nem mata proxies.
+- `memwatch.sh` (legado, fora do repo) também passou a apenas alertar.
+- O healthcheck continua supervisionando os serviços críticos, mas não há mais
+  watchdog que derrube conexões autenticadas por causa de RAM.
+
+### Correção do vazamento de memória do BHTTP (25/11/2026)
+
+O `dlBuf` parecia estável em `6144KB`, mas `s.dlBuf = s.dlBuf[cut:]` reduzia
+apenas `len` e mantinha o `cap` do array grande alocado durante speedtests.
+Com isso o RSS ficava em ~1,2–1,3 GB enquanto o log reportava só ~47 MB de
+`dlBuf_total`.
+
+- Novo `compactDLBufLocked()` copia os bytes vivos para um array novo quando
+  `cap-len >= 4MB`, chamado pelo reaper sob `s.mu`.
+- `logRAM()` agora reporta também `dlBuf_cap`, para medir a memória realmente
+  retida.
+- Nenhuma regra de replay/ACK/janela foi alterada; testes Go passaram e o
+  binário aarch64 foi reconstruído.

@@ -272,13 +272,14 @@ func readUintFrom(path, key string) int64 {
 // logRAM loga o uso de RAM periodicamente (chamado pelo reaper).
 func logRAM() {
 	ram := getRAMInfo()
-	var totalDL int64
+	var totalDL, totalDLCap int64
 	registry.mu.Lock()
 	sessions := len(registry.m)
 	var top []*Session
 	for _, s := range registry.m {
 		s.mu.Lock()
 		totalDL += int64(len(s.dlBuf))
+		totalDLCap += int64(cap(s.dlBuf))
 		if s.upInBytes+s.dlInBytes > 0 {
 			top = append(top, s)
 		}
@@ -316,13 +317,13 @@ log.Printf("SESSAO %x: UP in=%d out=%d (bal=%d) DL in=%d out=%d empty=%d dlBuf=%
 			s.mu.Unlock()
 		}
 	}
-	log.Printf("RAM: %.1f%% usada (%.1fMB/%.1fMB) disponivel=%.1fMB sessoes=%d dlBuf_total=%.1fMB",
+	log.Printf("RAM: %.1f%% usada (%.1fMB/%.1fMB) disponivel=%.1fMB sessoes=%d dlBuf_total=%.1fMB dlBuf_cap=%.1fMB",
 		ram.UsedPct,
 		float64(ram.Used)/(1024*1024),
 		float64(ram.Total)/(1024*1024),
 		float64(ram.Available)/(1024*1024),
 		sessions,
-		float64(totalDL)/(1024*1024))
+		float64(totalDL)/(1024*1024), float64(totalDLCap)/(1024*1024))
 }
 
 // getMemStats retorna estatisticas Go runtime para debug.
@@ -1079,6 +1080,25 @@ func (s *Session) trimServedLocked() int64 {
 		}
 	}
 	return cut
+}
+
+// compactDLBufLocked devolve ao GC o backing array antigo de dlBuf.
+// reslice (s.dlBuf = s.dlBuf[cut:]) reduz len mas mantém cap: o array
+// grande alocado no speedtest continua vivo e o RSS não cai.
+// Chamado SEMPRE com s.mu HOLD. Copia só os bytes vivos para um array
+// novo com capacidade exata. minWaste evita copiar 6MB a cada 32KB.
+func (s *Session) compactDLBufLocked(minWaste int) {
+	n := len(s.dlBuf)
+	if n == 0 {
+		s.dlBuf = nil
+		return
+	}
+	if cap(s.dlBuf)-n < minWaste {
+		return
+	}
+	nb := make([]byte, n)
+	copy(nb, s.dlBuf)
+	s.dlBuf = nb
 }
 
 func (s *Session) onAck(j int64) {
@@ -1913,6 +1933,15 @@ func reaper() {
 					s.key[:4], cut/1024, (cut+int64(len(s.dlBuf)))/1024, len(s.dlBuf)/1024)
 				s.cond.Broadcast()
 			}
+		}
+
+		// Libera o cap antigo de dlBuf. Sem isso o "limpou 0KB" reduz
+		// len, mas o array de ~256MB alocado no speedtest fica preso
+		// pelo sufixo de 6MB e o RSS não volta.
+		for _, ci := range candidates {
+			ci.s.mu.Lock()
+			ci.s.compactDLBufLocked(4 << 20)
+			ci.s.mu.Unlock()
 		}
 	}
 }
