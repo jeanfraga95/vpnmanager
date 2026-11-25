@@ -162,3 +162,33 @@ Com isso o RSS ficava em ~1,2–1,3 GB enquanto o log reportava só ~47 MB de
   retida.
 - Nenhuma regra de replay/ACK/janela foi alterada; testes Go passaram e o
   binário aarch64 foi reconstruído.
+
+### Proxy unificado na porta 80 (25/11/2026)
+
+O `fallback-proxy` (19080) foi eliminado. O binário
+`bin/aarch64/vpnproxy-unified` (fonte em `src/vpnproxy/`) faz o sniff na própria
+porta pública e roteia sem redial externo:
+
+- **BHTTP** TCP/TLS/QUIC → motor `bhttpssh` inalterado → `127.0.0.1:2223`.
+- **HCR plain** → `127.0.0.1:18082` (módulo loopback interno).
+- **XHTTP** (`x-http-sid` / `x-session-id`) → `127.0.0.1:11443` (módulo loopback).
+- **WebSocket CloudJF, CONNECT, SOCKS4/5, TLS/SNI e decoys** → dentro do próprio
+  processo (`src/vpnproxy/internal/wsproxy/`), com `101` em 50ms e `--auto-200`.
+- **Zero bytes iniciais** continua indo para BHTTP; SSH direto permanece atrás de
+  CONNECT/SOCKS/WS (sem probe ativo, para não quebrar CGNAT/4G).
+
+O mesmo número de porta atende TCP e UDP; o QUIC é separado por ALPN
+(`bhttp-ssh`). O motor BHTTP não foi alterado: apenas o ponto de decisão
+`pipeFallback` virou dispatcher interno e o sniff passou a ser incondicional em
+TCP. O replay dos bytes parciais do sniff também foi corrigido (SOCKS4/5 antes
+perdiam os bytes lidos antes do timeout).
+
+Rollback: `/root/rollback_unified.sh`. Backup completo:
+`/root/backup_unified_cutover_20261125_140620.tar.gz`.
+A unit `vpnproxy-unified-8080.service` foi preparada, mas **não foi habilitada**;
+a 8080 segue com o proxy C (`vpnproxy-ws-8080`).
+
+Validação: `101 → 200 → banner SSH`, CONNECT e SOCKS5 idênticos ao baseline da
+8080; XHTTP e HCR roteados corretamente; TLS 1.3 com ALPN `bhttp-ssh`; ~98
+conexões reais na 80 com `WRITE->SSHD` no log; RSS ~55MB, 138 FDs, 6 threads;
+portas `8443/8787/8788/9090/9443/18082/11443` fechadas externamente.
