@@ -98,9 +98,10 @@ func Serve(c net.Conn, cfg *Config) {
 	var n int
 	var err error
 	if cfg.Silent {
-		// O sniff da 8080 ja esperou o cliente; mandar o 101 agora evita
-		// somar mais 50ms e replica o aceite do proxy C.
-		p.sendImmediate101()
+		// Cliente silencioso: 101 completo (Upgrade/Connection), equivalente
+		// ao send_ws_101("") do proxy C. Clients WebSocket estritos rejeitam
+		// a resposta sem headers e abortam logo apos a status line 101 OK.
+		p.sendWS101("")
 		p.sent101 = true
 		p.state = stWSMagic
 		p.armMagicTimer()

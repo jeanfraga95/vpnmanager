@@ -221,3 +221,34 @@ enviava `101` em 50ms nesse caso.
 - Validação: 11/11 no teste silencioso + 13/13 no QA de cada porta.
 - Rollback específico: `/root/rollback_silent_ws.sh`
   (backup `/root/backup_silent_ws_20261125_150120`).
+
+### 101 completo no `--silent-ws` (25/11/2026, 15:19 UTC)
+
+A primeira versão do `--silent-ws` enviava `HTTP/1.1 101 OK\r\n\r\n` cru. O app
+reconhecia a status line (logava "101 OK") mas, em clientes WebSocket estritos,
+rejeitava a resposta por não haver `Upgrade: websocket` / `Connection: Upgrade`
+e abortava logo depois, ou expirava a leitura.
+
+Agora o ramo `cfg.Silent` usa o mesmo formato do `send_ws_101("")` do proxy C:
+
+```
+HTTP/1.1 101 OK
+Upgrade: websocket
+Connection: Upgrade
+Server: nginx
+X-Request-Id: <hex>
+```
+
+O `200 OK` + banner SSH continua sendo enviado somente após o payload seguinte
+do cliente. O `101` com `Sec-WebSocket-Key` (GET legítimo) permanece com
+`101 Switching Protocols` + `Sec-WebSocket-Accept`.
+
+- Build reproduzível: `scripts/build_unified.py` reaplica
+  `scripts/apply_silent_ws.py` (com o `sendWS101("")` no ramo silent) e roda
+  `gofmt`.
+- Validação: 11/11 silent + 13/13 em cada porta; cliente externo recebeu o
+  `101` completo em 14ms e o `200` + banner em seguida.
+- Deploy: só a unit da 8080 foi reiniciada. A 80 continua com zero bytes →
+  BHTTP.
+- Rollback: `/root/rollback_ws101hdr.sh`
+  (backup `/root/backup_ws101hdr_20261125_151859`).

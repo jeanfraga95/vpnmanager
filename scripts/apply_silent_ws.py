@@ -127,9 +127,10 @@ NEW_SERVE = '''\tbuf := make([]byte, 8192)
 \tvar n int
 \tvar err error
 \tif cfg.Silent {
-\t\t// O sniff da 8080 ja esperou o cliente; mandar o 101 agora evita
-\t\t// somar mais 50ms e replica o aceite do proxy C.
-\t\tp.sendImmediate101()
+\t\t// Cliente silencioso: 101 completo (Upgrade/Connection), equivalente
+\t\t// ao send_ws_101("") do proxy C. Clients WebSocket estritos rejeitam
+\t\t// a resposta sem headers e abortam logo apos a status line 101 OK.
+\t\tp.sendWS101("")
 \t\tp.sent101 = true
 \t\tp.state = stWSMagic
 \t\tp.armMagicTimer()
