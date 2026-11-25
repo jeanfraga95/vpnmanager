@@ -252,3 +252,44 @@ do cliente. O `101` com `Sec-WebSocket-Key` (GET legítimo) permanece com
   BHTTP.
 - Rollback: `/root/rollback_ws101hdr.sh`
   (backup `/root/backup_ws101hdr_20261125_151859`).
+
+### Caminho silent sem `200` extra (25/11/2026, 15:31 UTC)
+
+O `proxyjf` (C) funciona bem no app porque, no caminho silencioso, ele faz apenas
+três coisas: envia o `101` completo, consome o request inicial do cliente e entra
+direto na ponte TCP — sem enviar um `200 OK` extra. Não foi aproveitada a
+simplicidade dele de não filtrar decoys/múltiplos métodos: esse filtro continua
+no `wsproxy` Go.
+
+Agora o ramo `--silent-ws` (usado só na 8080) segue exatamente esse fluxo:
+
+```
+TCP sem payload -> 101 completo em ~50ms
+payload seguinte (npv-x, decoy ou múltiplos métodos) -> ponte direta, sem 200
+GET legítimo com Sec-WebSocket-Key -> 101 Switching Protocols + Accept + 200
+```
+
+O `200 OK` continua presente em todos os outros caminhos (GET-first, CONNECT,
+SOCKS, XHTTP e BHTTP). A porta 80 não usa `--silent-ws`: zero bytes continua
+indo para BHTTP.
+
+- Build reproduzível: `scripts/build_unified.py` reaplica
+  `scripts/apply_silent_ws.py` e `scripts/apply_nomagic200.py`, roda `gofmt` e
+  o binário é gerado com `CGO_ENABLED=1 /usr/local/go/bin/go build -o
+  bin/aarch64/vpnproxy-unified .` (sem `-trimpath`/`-ldflags`).
+- Hash do binário: `f38283eeab05410fdaa5cbfd0abd3b8e4bf9e3f75e17cc4d94384d5baec471ef`.
+- Validação: 8/8 no QA específico do silent e 13/13 no QA completo em cada
+  porta temporária (18098 sem a flag, 18099 com a flag) e em produção (80 e
+  8080). O `ActiveEnterTimestamp` da unit da 80 não mudou no deploy.
+- Deploy: só `vpnproxy-unified-8080.service` foi reiniciado.
+- Rollback: `/root/rollback_nomagic200.sh`
+  (backup `/root/backup_nomagic200_20261125_153144`).
+
+### Rollback temporário para o C e restauração do Go (25/11/2026)
+
+Às 15:40 UTC a stack pré-Go foi restaurada (`/root/rollback_unified.sh`:
+BHTTP 80 + fallback 19080 + `vpnproxy-ws-8080` com o binário C
+`cd67643c…`). O app em dados móveis apresentou o mesmo sintoma após o `101`,
+então às 15:59 UTC a stack Go foi restabelecida com o binário `f38283ee…` e
+todas as validações passaram novamente (8/8 silent + 13/13 em cada porta).
+As units Go estão enabled/active; as units antigas permanecem disabled.

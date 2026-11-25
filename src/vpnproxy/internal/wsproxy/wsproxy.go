@@ -74,6 +74,7 @@ type proxyConn struct {
 	pendingSSH []byte // carry do gate "SSH-" fragmentado
 	reply      []byte // resposta enfileirada para o cliente (CONNECT/SOCKS)
 	pending    []byte // ClientHello enfileirado para o remoto
+	silent101  bool   // 101 enviado no ramo --silent-ws (sem 200 extra)
 	writeMu    sync.Mutex
 	closeOnce  sync.Once
 	magicTimer *time.Timer
@@ -103,6 +104,7 @@ func Serve(c net.Conn, cfg *Config) {
 		// a resposta sem headers e abortam logo apos a status line 101 OK.
 		p.sendWS101("")
 		p.sent101 = true
+		p.silent101 = true
 		p.state = stWSMagic
 		p.armMagicTimer()
 	} else {
@@ -292,7 +294,10 @@ func (p *proxyConn) processWSMagic() bool {
 			}
 		}
 		p.clientBuf = b
-		p.send200()
+		if !p.silent101 { // proxyjf: apos o 101 imediato, vai direto a ponte
+			p.send200()
+		}
+		p.silent101 = false
 		return p.startRelay(p.cfg.ToAddr, p.cfg.ToPort, false)
 	}
 

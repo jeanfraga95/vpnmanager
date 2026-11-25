@@ -227,6 +227,14 @@ if os.path.exists(PATCH):
 else:
     print('AVISO: patch silent-ws nao encontrado:', PATCH)
 
+# 3b) patch reprodutivel do caminho silent sem 200 extra (proxyjf-like).
+PATCH2 = '/tmp/vpnfull/scripts/apply_nomagic200.py'
+if os.path.exists(PATCH2):
+    ns2 = {'DST': DST, '__name__': '__main__'}
+    exec(compile(open(PATCH2).read(), PATCH2, 'exec'), ns2)
+else:
+    print('AVISO: patch nomagic200 nao encontrado:', PATCH2)
+
 # gofmt para manter o fonte versionado estavel entre rebuilds.
 import subprocess
 subprocess.check_call(['/usr/local/go/bin/gofmt', '-w',
