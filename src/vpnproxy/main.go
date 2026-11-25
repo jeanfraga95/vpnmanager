@@ -119,6 +119,7 @@ var (
 	flagQUICPort = flag.Int("quic-port", 0, "porta UDP para QUIC (0 = desabilitado)")
 	flagTLSCert  = flag.String("tls-cert", "", "caminho para certificado TLS (para QUIC)")
 	flagTLSKey   = flag.String("tls-key", "", "caminho para chave TLS (para QUIC)")
+	flagSilentWS = flag.Bool("silent-ws", false, "conexao sem dados iniciais recebe 101 (como o C) em vez de virar BHTTP")
 
 	dtLn      net.Listener
 	dtAddr    string
@@ -1394,7 +1395,11 @@ func handleConn(c net.Conn, dest string, fallback string) {
 	}
 	if !isQUIC {
 		// peek no primeiro byte para detectar TLS ClientHello (0x16)
-		c.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		sniffWait := 200 * time.Millisecond
+		if *flagSilentWS {
+			sniffWait = 50 * time.Millisecond
+		}
+		c.SetReadDeadline(time.Now().Add(sniffWait))
 		one := make([]byte, 1)
 		n, err := io.ReadFull(c, one)
 		c.SetReadDeadline(time.Time{})
@@ -1445,6 +1450,11 @@ func handleConn(c net.Conn, dest string, fallback string) {
 					routeWS(c, pfx)
 					return
 				}
+				if *flagSilentWS {
+					log.Printf("CONN %s: frame fragmentado %dB no modo silent-ws -> WS", c.RemoteAddr(), len(pfx))
+					routeWS(c, pfx)
+					return
+				}
 				c = &prefixConn{Conn: c, prefix: pfx}
 			} else {
 				hdr := append(one, rest...)
@@ -1469,6 +1479,14 @@ func handleConn(c net.Conn, dest string, fallback string) {
 				c = &prefixConn{Conn: c, prefix: append([]byte(nil), hdr...)}
 			}
 		} else {
+			if *flagSilentWS {
+				// Comportamento do proxy C na 8080: o app abre a TCP e espera
+				// o 101. No 4G/CGNAT o 1o pacote pode demorar; sem isso a
+				// conexao cairia no motor BHTTP e nunca responderia.
+				log.Printf("CONN %s: sniff nil no modo silent-ws -> 101 imediato", c.RemoteAddr())
+				routeWS(c, nil)
+				return
+			}
 			// timeout sem dados — assume BHTTP
 			log.Printf("CONN %s: sniff nil (timeout sem dados), assume BHTTP", c.RemoteAddr())
 		}

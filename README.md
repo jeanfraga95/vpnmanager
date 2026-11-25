@@ -196,3 +196,28 @@ Validação: `101 → 200 → banner SSH`, CONNECT e SOCKS5 idênticos ao baseli
 80 e 8080; XHTTP e HCR roteados corretamente; TLS 1.3 com ALPN `bhttp-ssh`; ~98
 conexões reais na 80 com `WRITE->SSHD` no log; RSS ~55MB, 138 FDs, 6 threads;
 portas `8443/8787/8788/9090/9443/18082/11443` fechadas externamente.
+
+### `--silent-ws` na 8080 (25/11/2026)
+
+O app CloudJF abre a conexão TCP e **espera o `101` antes de enviar qualquer payload**.
+No WiFi o primeiro pacote chegava dentro do sniff de 200ms e a conexão virava
+WebSocket; no 4G/CGNAT o pacote demorava e o sniff caía no motor BHTTP
+(`sniff nil (timeout sem dados), assume BHTTP`), que não responde nada. O proxy C
+enviava `101` em 50ms nesse caso.
+
+- Nova flag `--silent-ws`, usada **apenas** em `vpnproxy-unified-8080.service`.
+- Com a flag o sniff cai de 200ms para 50ms. Zero bytes, frame incompleto ou
+  qualquer prefixo não identificado vão para o `wsproxy`, que responde
+  `HTTP/1.1 101 OK` em ~50ms; o payload seguinte recebe `200 OK` + banner SSH.
+- Regra de roteamento: **BHTTP, HCR e XHTTP** continuam nos seus motores;
+  **todo o resto** (WebSocket, CONNECT, SOCKS4/5, TLS bruto, decoys e payloads
+  arbitrários) é tratado como WebSocket/SOCKS pelo dispatcher interno.
+- A porta 80 **não** usa a flag: zero bytes continua indo para BHTTP.
+- Tradeoff: na 8080, um cliente BHTTP que demore >50ms para enviar o primeiro
+  frame receberá o 101 e não falará BHTTP nessa conexão. O app BHTTP normal envia
+  imediatamente e segue no motor BHTTP; o app VPN no 4G envia nada e recebe o 101.
+- Fontes geradas por `scripts/build_unified.py`, que reaplica
+  `scripts/apply_silent_ws.py` e roda `gofmt` — rebuilds são reproduzíveis.
+- Validação: 11/11 no teste silencioso + 13/13 no QA de cada porta.
+- Rollback específico: `/root/rollback_silent_ws.sh`
+  (backup `/root/backup_silent_ws_20261125_150120`).

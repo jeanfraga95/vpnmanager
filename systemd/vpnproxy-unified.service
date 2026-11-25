@@ -1,0 +1,22 @@
+[Unit]
+Description=VPNManager unified proxy 80 (BHTTP/QUIC/TLS + HCR + WS + XHTTP + SSH + CONNECT/SOCKS)
+After=network-online.target ssh.service sshd-bhttp.service hcr-server.service vpnproxy-xhttp-11443.service
+Wants=network-online.target ssh.service sshd-bhttp.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/etc/VPNManager/bin/vpnproxy-unified --port 80 \
+  --static-target 127.0.0.1:2223 --idle 24h \
+  --quic-port 80 \
+  --tls-cert /etc/VPNManager/conf/bhttp_80_cert.pem \
+  --tls-key /etc/VPNManager/conf/bhttp_80_key.pem \
+  --hcr-target 127.0.0.1:18082 \
+  --xhttp-target 127.0.0.1:11443 \
+  --ws-to 127.0.0.1:22
+Restart=always
+RestartSec=3
+LimitNOFILE=1000000
+
+[Install]
+WantedBy=multi-user.target

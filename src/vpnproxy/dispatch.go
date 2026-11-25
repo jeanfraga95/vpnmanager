@@ -68,7 +68,13 @@ func rawPipe(c net.Conn, prefix []byte, target, label string) {
 // routeWS entrega a conexao direto ao proxy WS/CONNECT/SOCKS, sem passar
 // pelo teste de HCR (usado quando o greeting SOCKS ja foi identificado).
 func routeWS(c net.Conn, prefix []byte) {
-	wsproxy.Serve(&prefixConn{Conn: c, prefix: prefix}, wsConfig())
+	cfg := wsConfig()
+	if *flagSilentWS && len(prefix) == 0 {
+		silent := *cfg
+		silent.Silent = true
+		cfg = &silent
+	}
+	wsproxy.Serve(&prefixConn{Conn: c, prefix: prefix}, cfg)
 }
 
 // routeNonBHTTP recebe a conexao com os primeiros 'prefix' bytes ja lidos

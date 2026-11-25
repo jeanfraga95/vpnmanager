@@ -40,6 +40,7 @@ type Config struct {
 	TLSPort      int
 	SNIAllow     string
 	AuthToken    string
+	Silent       bool // envia 101 sem esperar o 1o read (cliente silencioso)
 }
 
 type State uint8
@@ -94,28 +95,39 @@ func Serve(c net.Conn, cfg *Config) {
 	setSockOpts(c, cfg.Keepalive)
 
 	buf := make([]byte, 8192)
-	c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
-	n, err := c.Read(buf)
-	if n > 0 {
-		p.clientBuf = append(p.clientBuf, buf[:n]...)
-	}
-	if err != nil {
-		ne, timeout := err.(net.Error)
-		if timeout && ne.Timeout() && p.state == stInit && cfg.Immediate101 &&
-			cfg.AuthToken == "" && !p.sent101 && n == 0 {
-			// Cliente silenciou: 101 exato do proxy original e passa a
-			// aguardar dados. Não processa ST_WS_MAGIC agora (o C só responde
-			// ao próximo read callback).
-			p.sendImmediate101()
-			p.sent101 = true
-			p.state = stWSMagic
-			p.armMagicTimer()
-		} else if n == 0 {
-			return
+	var n int
+	var err error
+	if cfg.Silent {
+		// O sniff da 8080 ja esperou o cliente; mandar o 101 agora evita
+		// somar mais 50ms e replica o aceite do proxy C.
+		p.sendImmediate101()
+		p.sent101 = true
+		p.state = stWSMagic
+		p.armMagicTimer()
+	} else {
+		c.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		n, err = c.Read(buf)
+		if n > 0 {
+			p.clientBuf = append(p.clientBuf, buf[:n]...)
 		}
-		// Se n > 0, processa os bytes recebidos mesmo com erro de leitura.
+		if err != nil {
+			ne, timeout := err.(net.Error)
+			if timeout && ne.Timeout() && p.state == stInit && cfg.Immediate101 &&
+				cfg.AuthToken == "" && !p.sent101 && n == 0 {
+				// Cliente silenciou: 101 exato do proxy original e passa a
+				// aguardar dados. Não processa ST_WS_MAGIC agora (o C só responde
+				// ao próximo read callback).
+				p.sendImmediate101()
+				p.sent101 = true
+				p.state = stWSMagic
+				p.armMagicTimer()
+			} else if n == 0 {
+				return
+			}
+			// Se n > 0, processa os bytes recebidos mesmo com erro de leitura.
+		}
+		c.SetReadDeadline(time.Time{})
 	}
-	c.SetReadDeadline(time.Time{})
 
 	if len(p.clientBuf) > 0 {
 		if !p.processPreRelay() {
