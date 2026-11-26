@@ -250,6 +250,18 @@ if os.path.exists(PATCH3):
 else:
     print('AVISO: patch batch-order nao encontrado:', PATCH3)
 
+# 3d) patch reprodutivel da janela de sniff do --silent-ws.
+# O app informa rtt=81ms; 50ms devolvia 101 antes do 1o frame BHTTP.
+PATCH4 = os.path.join(SCRIPTS, 'apply_sniff_wait.py')
+if os.path.exists(PATCH4):
+    import importlib.util
+    _spec4 = importlib.util.spec_from_file_location('apply_sniff_wait', PATCH4)
+    _mod4 = importlib.util.module_from_spec(_spec4)
+    _spec4.loader.exec_module(_mod4)
+    _mod4.apply(DST + '/main.go')
+else:
+    print('AVISO: patch sniff-wait nao encontrado:', PATCH4)
+
 # gofmt para manter o fonte versionado estavel entre rebuilds.
 import subprocess
 subprocess.check_call(['/usr/local/go/bin/gofmt', '-w',
