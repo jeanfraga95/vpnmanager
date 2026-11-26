@@ -276,6 +276,18 @@ if os.path.exists(PATCH5):
 else:
     print('AVISO: patch dl-firstwindow nao encontrado:', PATCH5)
 
+# 3g) gapskip: no timeout do gap wait, comita ordinais ausentes como
+# vazio e avanca nextIdx (evita bail storm / DL out congelado).
+PATCH7 = os.path.join(SCRIPTS, 'apply_dl_gapskip.py')
+if os.path.exists(PATCH7):
+    import importlib.util
+    _spec7 = importlib.util.spec_from_file_location('apply_dl_gapskip', PATCH7)
+    _mod7 = importlib.util.module_from_spec(_spec7)
+    _spec7.loader.exec_module(_mod7)
+    _mod7.apply(DST + '/main.go')
+else:
+    print('AVISO: patch dl-gapskip nao encontrado:', PATCH7)
+
 # gofmt para manter o fonte versionado estavel entre rebuilds.
 import subprocess
 subprocess.check_call(['/usr/local/go/bin/gofmt', '-w',

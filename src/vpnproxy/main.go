@@ -860,6 +860,15 @@ func (s *Session) pushUpload(seq uint64, data []byte, c net.Conn) bool {
 // entao reporta Packet corrupt no meio da autenticacao. Abre-se uma janela
 // curta (200ms, ~2.5 RTT do app) para os menores chegarem e reivindicarem
 // a vez; so ancora em k se ele for o menor ao fim da janela.
+// waitTimed espera no cond com despertar garantido apos d. sync.Cond
+// nao tem timeout: sem o timer, um gap wait so reavalia o limite quando
+// outra goroutine broadcasta e um ordinal perdido trava para sempre.
+func (s *Session) waitTimed(d time.Duration) {
+	t := time.AfterFunc(d, func() { s.cond.Broadcast() })
+	s.cond.Wait()
+	t.Stop()
+}
+
 func (s *Session) getChunk(k int64, reqSize int) (data []byte, st byte, dead bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -962,12 +971,21 @@ func (s *Session) getChunk(k int64, reqSize int) (data []byte, st byte, dead boo
 			}
 			if time.Since(waitStart) > limit {
 				delete(s.dlPending, k)
+				if k == minK && s.anchored && k > s.nextIdx {
+					for miss := s.nextIdx; miss < k; miss++ {
+						s.served[miss] = chunkSpan{start: s.nextOff, end: s.nextOff}
+					}
+					s.nextIdx = k
+					s.cond.Broadcast()
+					vlog("sessao %x: getChunk(%d) pulou gap (ordinais ausentes) -> nextIdx=%d", s.key[:4], k, k)
+					break
+				}
 				s.dlBailCount++
 				s.cond.Broadcast()
 				vlog("sessao %x: getChunk(%d) baiilou apos espera (minK=%d)", s.key[:4], k, minK)
 				return []byte{}, 0, false
 			}
-			s.cond.Wait()
+			s.waitTimed(limit)
 			continue
 		}
 		break
@@ -1081,12 +1099,21 @@ func (s *Session) getBatch(base int64, reqSize int, n int) (datas [][]byte, dead
 			}
 			if time.Since(waitStart) > limit {
 				delete(s.dlPending, base)
+				if base == minK && s.anchored && base > s.nextIdx {
+					for miss := s.nextIdx; miss < base; miss++ {
+						s.served[miss] = chunkSpan{start: s.nextOff, end: s.nextOff}
+					}
+					s.nextIdx = base
+					s.cond.Broadcast()
+					vlog("sessao %x: getBatch(%d) pulou gap (ordinais ausentes) -> nextIdx=%d", s.key[:4], base, base)
+					break
+				}
 				s.dlBailCount++
 				s.cond.Broadcast()
 				vlog("sessao %x: getBatch(%d) baiilou apos espera (minK=%d, gap=%v)", s.key[:4], base, minK, gap)
 				return datas, false
 			}
-			s.cond.Wait()
+			s.waitTimed(limit)
 			continue
 		}
 		break
