@@ -235,6 +235,18 @@ if os.path.exists(PATCH2):
 else:
     print('AVISO: patch nomagic200 nao encontrado:', PATCH2)
 
+# 3c) patch reprodutivel da ordenacao de batches (packet corrupt com
+# batch=true + multiplas conexoes): mesmo turno dlPending/minK do getChunk.
+PATCH3 = '/tmp/vpnfull/scripts/apply_batch_order.py'
+if os.path.exists(PATCH3):
+    import importlib.util
+    _spec = importlib.util.spec_from_file_location('apply_batch_order', PATCH3)
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    _mod.apply(DST + '/main.go')
+else:
+    print('AVISO: patch batch-order nao encontrado:', PATCH3)
+
 # gofmt para manter o fonte versionado estavel entre rebuilds.
 import subprocess
 subprocess.check_call(['/usr/local/go/bin/gofmt', '-w',
