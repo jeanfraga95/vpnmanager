@@ -425,7 +425,10 @@ As units Go estão enabled/active; as units antigas permanecem disabled.
 - O restore recria os usuários com **o mesmo login, senha e validade** mesmo
   em máquina sem VPNManager prévio (`/etc/passwd`, `/etc/shadow`, `/etc/group`,
   `/etc/SSHPlus/senha/<user>` e `chage -E`). Antes de sobrescrever, salva
-  `pre_restore_<ts>.tar.gz` com esses mesmos arquivos.
+  `pre_restore_<ts>.tar.gz` com esses mesmos arquivos. O restore não
+  sobrescreve `etc/VPNManager/bin` (binários reinstaláveis) e só reinicia as
+  units do proxy que já estavam ativas, para não religar units antigas em
+  portas de terceiros (ex.: `proto-server` na 80/443).
 - Toda interação com o bot (mensagem, clique ou documento) registra o chat em
   `clientes.txt`; antes de gerar o backup, a lista é completada com quem já
   testou, comprou ou está em fluxo pendente, ficando completa para

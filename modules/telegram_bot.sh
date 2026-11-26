@@ -1341,19 +1341,25 @@ Envie o .tar.gz novamente e, quando o bot perguntar, toque em ✅ Sim, restaurar
     tar -czf "$BACKUP_DIR/pre_restore_$ts.tar.gz" \
         /etc/passwd /etc/shadow /etc/group /etc/ssh/sshd_config \
         /etc/SSHPlus /root/usuarios.db \
-        "$PM_DB" "$COMPRAS_DB" "$INSTALL_DIR/conf" 2>/dev/null
+        "$PM_DB" "$COMPRAS_DB" "$INSTALL_DIR/conf" \
+        /etc/systemd/system/vpnproxy-*.service 2>/dev/null
 
-    tar -xzf "$tarfile" -C / 2>>/var/log/vpnbot_restore.log
+    # Binarios do painel sao reinstalaveis e a versao corrigida deve ser
+    # preservada. Units antigas voltam com o backup, mas so sao reiniciadas
+    # as que ja estavam ativas — evita conflito com portas de terceiros.
+    tar -xzf "$tarfile" -C / \
+        --exclude='etc/VPNManager/bin' 2>>/var/log/vpnbot_restore.log
     local rc=$?
     rm -f "$tarfile"
 
-    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
-    systemctl restart xray 2>/dev/null
-    systemctl restart v2ray 2>/dev/null
+    local active_services
+    active_services=$(systemctl list-units --type=service --state=active --no-legend 2>/dev/null \
+        | awk '{print $1}' | grep -E '^(vpnproxy|hcr-server|sshd-bhttp|checkuser|xray|v2ray)' || true)
+
     systemctl daemon-reload 2>/dev/null
-    for svc in /etc/systemd/system/vpnproxy-*.service /etc/systemd/system/badvpn-*.service; do
-        [[ -f "$svc" ]] || continue
-        systemctl restart "$(basename "$svc" .service)" 2>/dev/null
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null
+    for svc in $active_services; do
+        systemctl restart "$svc" 2>/dev/null
     done
 
     # A loja le planos/token do Mercado Pago na inicializacao do worker.
@@ -1365,7 +1371,7 @@ Envie o .tar.gz novamente e, quando o bot perguntar, toque em ✅ Sim, restaurar
     if [[ $rc -eq 0 ]]; then
         echo "✅ *Backup restaurado com sucesso!*
 
-Usuários SSH *com o mesmo login, senha e validade* (/etc/passwd, /etc/shadow, /etc/SSHPlus e `chage`), limites, configurações e credenciais Xray/V2Ray foram restaurados — mesmo em uma máquina onde o VPNManager ainda não existia.
+Usuários SSH *com o mesmo login, senha e validade* (\`/etc/passwd\`, \`/etc/shadow\`, \`/etc/SSHPlus/senha/<user>\` e \`chage -E\`), limites, configurações e credenciais Xray/V2Ray foram restaurados — mesmo em uma máquina onde o VPNManager ainda não existia.
 
 Tudo da *Loja & Vendas* também voltou: todos os que compraram, todos os que testaram, Mercado Pago, planos, mensagem de entrega, clientes, compras e a lista completa de quem já usou o bot (para divulgação/transmissão).
 
