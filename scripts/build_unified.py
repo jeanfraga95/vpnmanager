@@ -288,6 +288,18 @@ if os.path.exists(PATCH7):
 else:
     print('AVISO: patch dl-gapskip nao encontrado:', PATCH7)
 
+# 3h) burst: replay retain >= janela do app (8MB), CONGELAMENTO so
+# com backlog real e log do reaper throttled.
+PATCH8 = os.path.join(SCRIPTS, 'apply_dl_burst.py')
+if os.path.exists(PATCH8):
+    import importlib.util
+    _spec8 = importlib.util.spec_from_file_location('apply_dl_burst', PATCH8)
+    _mod8 = importlib.util.module_from_spec(_spec8)
+    _spec8.loader.exec_module(_mod8)
+    _mod8.apply(DST + '/main.go')
+else:
+    print('AVISO: patch dl-burst nao encontrado:', PATCH8)
+
 # gofmt para manter o fonte versionado estavel entre rebuilds.
 import subprocess
 subprocess.check_call(['/usr/local/go/bin/gofmt', '-w',

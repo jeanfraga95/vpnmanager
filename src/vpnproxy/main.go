@@ -96,7 +96,7 @@ const (
 	// de virar vazio e encolher a janela (congelamento pos-speedtest).
 	// tambem escala com curDLCap() (ver curReplayRetain).
 	replayRetainMax = 256 << 20
-	replayRetainMin = 2 << 20
+	replayRetainMin = 8 << 20          // janela do app e 8MB: retain menor gera vazio no re-pull
 	idleSessionTTL  = 15 * time.Minute // zumbi (app sumiu sem fechar limpo) e liberado logo; ajustavel via --idle
 	connIdleTO      = 24 * time.Hour
 	connWriteTO     = 30 * time.Second // timeout de escrita no app (mobile CGNAT precisa de mais tempo)
@@ -166,7 +166,9 @@ func updateDynamicCaps(ram ramInfo, nSessions int) {
 	if per < dlSoftCapMin {
 		per = dlSoftCapMin
 	}
-	retain := per / 2
+	// retem pelo menos a janela do app (8MB) para o re-pull nao
+	// devolver vazio e encolher a janela durante rajadas.
+	retain := per * 2 / 3
 	if retain > replayRetainMax {
 		retain = replayRetainMax
 	}
@@ -2043,6 +2045,8 @@ func reaper() {
 			if !s.dead && s.everData && !s.lastDLAdvance.IsZero() &&
 				(s.dlOutBytes > 0 || len(s.dlBuf) > 0) &&
 				time.Since(s.lastDLAdvance) >= 30*time.Second &&
+				time.Since(s.last) <= 10*time.Second &&
+				len(s.dlBuf) >= 256<<10 &&
 				(s.lastUpWrite.IsZero() || time.Since(s.lastUpWrite) >= 30*time.Second) {
 				dlFrozen = append(dlFrozen, s)
 			}
@@ -2110,8 +2114,10 @@ func reaper() {
 			cut := s.trimServedLocked()
 			s.mu.Unlock()
 			if cut > 0 {
-				log.Printf("sessao %x: reaper limpou %dKB do dlBuf (%dKB -> %dKB)",
-					s.key[:4], cut/1024, (cut+int64(len(s.dlBuf)))/1024, len(s.dlBuf)/1024)
+				if cut >= 64<<10 {
+					log.Printf("sessao %x: reaper limpou %dKB do dlBuf (%dKB -> %dKB)",
+						s.key[:4], cut/1024, (cut+int64(len(s.dlBuf)))/1024, len(s.dlBuf)/1024)
+				}
 				s.cond.Broadcast()
 			}
 		}
