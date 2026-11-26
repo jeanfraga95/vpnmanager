@@ -459,6 +459,7 @@ type Session struct {
 	dlDeadCount   int64     // sessao morta/epoch mudou -> serviu vazio
 	dlResumeCnt   int64     // type=5 (resume) recebido — nao suportado, resposta vazia
 	lastDLAdvance time.Time // ultima vez que bytes reais fluíram ao app (getChunk/getBatch n>0)
+	firstDLAt     time.Time // instante do 1o pedido da janela (ordena os downloads iniciais)
 }
 
 // resetLocked zera todo o estado do ciclo anterior. chamador segura s.mu.
@@ -501,6 +502,7 @@ func (s *Session) resetLocked() {
 	s.dlDeadCount = 0
 	s.dlResumeCnt = 0
 	s.lastDLAdvance = time.Time{}
+	s.firstDLAt = time.Time{}
 	s.cond.Broadcast()
 	vlog("sessao %x: estado resetado (epoch=%d)", s.key, s.epoch)
 }
@@ -848,23 +850,21 @@ func (s *Session) pushUpload(seq uint64, data []byte, c net.Conn) bool {
 	return true
 }
 
-// getChunk — semantica PROVADA (autenticou e fluiu): o chunk k e uma
-// vez unica na sequencia global; vazio responde NA HORA, COMITA (span
-// vazio gravado) e avanca o cursor — o app alimenta o JSch com o que
-// vier e segue puxando. Fora da vez: espera a VEZ (minK), nunca os
-// dados. Replay idempotente p/ re-pedidos; EOF drenado = dead.
-// getChunk — modelo POSICIONAL puro: cada ordinal tem posicao unica e
-// fixa no stream (ancora + stride). Leitura instantanea sob mutex, SEM
-// esperas: dado presente = serve; ausente = comita vazio e o BACKFILL
-// no re-pull traz os bytes quando chegarem. Sem turnos => sem deadlock.
-// getChunk — modelo CURSOR/TURNOS (semantica A/C provada em producao:
-// autenticava e fluiu por horas): cada ordinal entrega, NA SUA VEZ
+// getChunk — modelo CURSOR/TURNOS: cada ordinal entrega, NA SUA VEZ
 // (minK), os bytes que estiverem no cursor; vazio comita e avanca a vez;
 // parcial sai imediato. Toda saida deleta pending => sem deadlock.
+//
+// ORDENACAO DA PRIMEIRA JANELA (packet corrupt com pipeline/multi-conexao):
+// o app dispara N downloads de uma vez. Se o ordinal maior pegar o mutex
+// primeiro e ancorar, os menores viram "obsoletos" e recebem vazio; o JSch
+// entao reporta Packet corrupt no meio da autenticacao. Abre-se uma janela
+// curta (200ms, ~2.5 RTT do app) para os menores chegarem e reivindicarem
+// a vez; so ancora em k se ele for o menor ao fim da janela.
 func (s *Session) getChunk(k int64, reqSize int) (data []byte, st byte, dead bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	ep := s.epoch
+
 	if ref, ok := s.served[k]; ok {
 		s.dlReplayCount++
 		if ref.start >= s.dlBase && ref.end <= s.dlBase+int64(len(s.dlBuf)) {
@@ -875,6 +875,38 @@ func (s *Session) getChunk(k int64, reqSize int) (data []byte, st byte, dead boo
 		}
 		return []byte{}, 0, false
 	}
+
+	if s.firstDLAt.IsZero() {
+		s.firstDLAt = time.Now()
+	}
+	// Espera COMMUM desde o primeiro pedido: cada goroutine tem o mesmo
+	// deadline, entao um ordinal que chega tarde ainda pode ser o menor.
+	if !s.anchored && k > 0 {
+		waitStart := time.Now()
+		for !s.anchored {
+			if s.dead || s.epoch != ep {
+				s.dlDeadCount++
+				return []byte{}, 0, false
+			}
+			minK := int64(-1)
+			first := true
+			for kk := range s.dlPending {
+				if first || kk < minK {
+					minK = kk
+					first = false
+				}
+			}
+			if k == minK && (time.Since(s.firstDLAt) >= 200*time.Millisecond ||
+				time.Since(waitStart) >= time.Second) {
+				break
+			}
+			s.dlPending[k] = struct{}{}
+			s.cond.Wait()
+		}
+		delete(s.dlPending, k)
+		s.cond.Broadcast()
+	}
+
 	if !s.anchored {
 		s.anchored = true
 		s.anchorIdx = k
@@ -882,14 +914,7 @@ func (s *Session) getChunk(k int64, reqSize int) (data []byte, st byte, dead boo
 		s.nextOff = s.dlBase
 	}
 	if k < s.nextIdx {
-		// ordinal obsoleto (re-pull de janela ja consumida/ACKada/apagada)
-		// Hoje devolve VAZIO p/ nunca tomar a vez no cursor atual. Mas no
-		// speedtest multi-conexao isso enche o app de vazios e encolhe a
-		// janela dele (congelamento). Se o span ainda estiver vivo em
-		// served[k] (nao foi trimmado) e estiver DENTRO da janela ja
-		// carregada, REENTREGAMOS em vez de vazio — o app recebe os bytes
-		// que esperava sem corromper o stream (bytes ja emitidos sob k).
-		// NAO reentregar chunks obsoletos — evita desync e packet corrupt
+		// ordinal obsoleto: NAO reentregar (evita desync/packet corrupt).
 		s.dlObsoleteCnt++
 		s.obsGap += s.nextIdx - k
 		s.obsGapN++
@@ -922,12 +947,20 @@ func (s *Session) getChunk(k int64, reqSize int) (data []byte, st byte, dead boo
 				first = false
 			}
 		}
-		if k != minK {
-			// nunca sera a vez: espera com timeout. Se a conexao que
-			// detinha minK morreu, sem timeout travaria TODOS os downloads
-			// desta sessao para sempre (sshd enche, app nunca expande a
-			// janela SSH → speedtest de upload engasga/congela).
-			if time.Since(waitStart) > 1*time.Second {
+		gap := k != minK
+		// Apos ancorar, k > nextIdx significa que ainda faltam ordinais
+		// menores chegarem (corrida entre conexoes). Servir agora faria os
+		// futuros menores virarem obsoletos. Espera curta quando somos o
+		// menor pendente; mais longa quando outro detem a vez.
+		if s.anchored && k > s.nextIdx {
+			gap = true
+		}
+		if gap {
+			limit := time.Second
+			if k == minK {
+				limit = 200 * time.Millisecond
+			}
+			if time.Since(waitStart) > limit {
 				delete(s.dlPending, k)
 				s.dlBailCount++
 				s.cond.Broadcast()
@@ -937,30 +970,31 @@ func (s *Session) getChunk(k int64, reqSize int) (data []byte, st byte, dead boo
 			s.cond.Wait()
 			continue
 		}
-		start := s.nextOff
-		avail := s.dlBase + int64(len(s.dlBuf))
-		rem := avail - start
-		n := int64(reqSize)
-		if rem < n {
-			n = rem
-		}
-		delete(s.dlPending, k)
-		s.served[k] = chunkSpan{start: start, end: start + n}
-		s.nextIdx = k + 1
-		if n > 0 {
-			out := make([]byte, n)
-			copy(out, s.dlBuf[start-s.dlBase:start-s.dlBase+n])
-			s.nextOff = start + n
-			s.dlOutBytes += n
-			s.lastDLAdvance = time.Now()
-			s.cond.Broadcast()
-			vlog("getChunk(%d,%d) -> %dB", k, reqSize, n)
-			return out, 0, false
-		}
-		s.dlEmptyHits++
-		s.cond.Broadcast()
-		return []byte{}, 0, false
+		break
 	}
+	delete(s.dlPending, k)
+	start := s.nextOff
+	avail := s.dlBase + int64(len(s.dlBuf))
+	rem := avail - start
+	n := int64(reqSize)
+	if rem < n {
+		n = rem
+	}
+	s.served[k] = chunkSpan{start: start, end: start + n}
+	s.nextIdx = k + 1
+	if n > 0 {
+		out := make([]byte, n)
+		copy(out, s.dlBuf[start-s.dlBase:start-s.dlBase+n])
+		s.nextOff = start + n
+		s.dlOutBytes += n
+		s.lastDLAdvance = time.Now()
+		s.cond.Broadcast()
+		vlog("getChunk(%d,%d) -> %dB", k, reqSize, n)
+		return out, 0, false
+	}
+	s.dlEmptyHits++
+	s.cond.Broadcast()
+	return []byte{}, 0, false
 }
 
 // getBatch serve N chunks contiguos em uma UNICA aquisicao do mutex,

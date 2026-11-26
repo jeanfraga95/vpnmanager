@@ -262,6 +262,20 @@ if os.path.exists(PATCH4):
 else:
     print('AVISO: patch sniff-wait nao encontrado:', PATCH4)
 
+# 3e) patch reprodutivel da ordenacao da PRIMEIRA janela de frameDownload.
+# O app com pipeline/multi-conexao dispara downloads paralelos; se o maior
+# ordinal ancora o cursor primeiro, os menores recebem vazio e o JSch
+# reporta "Packet corrupt" na autenticacao.
+PATCH5 = os.path.join(SCRIPTS, 'apply_dl_firstwindow.py')
+if os.path.exists(PATCH5):
+    import importlib.util
+    _spec5 = importlib.util.spec_from_file_location('apply_dl_firstwindow', PATCH5)
+    _mod5 = importlib.util.module_from_spec(_spec5)
+    _spec5.loader.exec_module(_mod5)
+    _mod5.apply(DST + '/main.go')
+else:
+    print('AVISO: patch dl-firstwindow nao encontrado:', PATCH5)
+
 # gofmt para manter o fonte versionado estavel entre rebuilds.
 import subprocess
 subprocess.check_call(['/usr/local/go/bin/gofmt', '-w',
