@@ -16,6 +16,9 @@ fi
 for sn in $CRITICAL_SVCS; do
     # Ignora servicos nao instalados
     systemctl cat "$sn" >/dev/null 2>&1 || continue
+    # Unidade mascarada foi desativada de proposito (ex.: porta 80
+    # pertence ao proto-server). Nao ressuscitar.
+    systemctl show -p LoadState "$sn" 2>/dev/null | grep -q '^LoadState=masked$' && continue
     if ! systemctl is-active --quiet "$sn" 2>/dev/null; then
         echo "$(date '+%Y-%m-%d %H:%M:%S') REINICIANDO $sn" >> "$LOG"
         systemctl restart "$sn" >/dev/null 2>&1 || true
