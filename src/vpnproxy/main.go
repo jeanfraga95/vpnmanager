@@ -1483,7 +1483,9 @@ func handleConn(c net.Conn, dest string, fallback string) {
 		// peek no primeiro byte para detectar TLS ClientHello (0x16)
 		sniffWait := 200 * time.Millisecond
 		if *flagSilentWS {
-			sniffWait = 50 * time.Millisecond
+			// App BHTTP reporta rtt=81ms: com 50ms o 1o frame chegava depois
+			// do 101 e o stream SSH era corrompido na autenticacao.
+			sniffWait = 200 * time.Millisecond
 		}
 		c.SetReadDeadline(time.Now().Add(sniffWait))
 		one := make([]byte, 1)
