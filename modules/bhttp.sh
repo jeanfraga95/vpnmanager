@@ -29,6 +29,75 @@ BHTTP_KEY="$INSTALL_DIR/conf/bhttp_80_key.pem"
 
 bhttp_is_installed(){ [[ -x "$UNIFIED_BIN" ]]; }
 
+# A porta 80 pode pertencer a outro sistema (ex.: proto-server/dtproto).
+# Nesses casos o VPNManager nunca a toca: 8080 vira a porta publica principal.
+_bhttp_port_listener(){
+    ss -lntp 2>/dev/null | awk -v p=":$1" '$4 ~ p"$" {print; exit}'
+}
+_bhttp_port_is_busy(){ [[ -n "$(_bhttp_port_listener "$1")" ]]; }
+_bhttp_port_process(){
+    local line; line=$(_bhttp_port_listener "$1")
+    grep -o 'users:(("[^"]*"' <<<"$line" | head -1 | sed 's/users:(("//; s/"$//'
+}
+_bhttp_port_is_ours(){
+    local line; line=$(_bhttp_port_listener "$1")
+    [[ -n "$line" ]] && grep -Eq 'vpnproxy|bhttpssh|hcr-server' <<<"$line"
+}
+
+# Certificados usados pelo proxy unificado e pelo HCR interno.
+# O instalador antigo criava esses arquivos via port80_stack.sh; aqui o
+# modulo BHTTP passa a garanti-los sozinho (inclusive quando a 80 esta
+# ocupada por outro sistema e o stack legado nao roda).
+_bhttp_ensure_certs(){
+    mkdir -p "$INSTALL_DIR/conf"
+    local cn; cn="$(hostname 2>/dev/null || echo vpnmanager)"
+    if [[ ! -f "$BHTTP_CERT" || ! -f "$BHTTP_KEY" ]]; then
+        openssl req -x509 -newkey rsa:2048 -keyout "$BHTTP_KEY" \
+            -out "$BHTTP_CERT" -days 3650 -nodes -subj "/CN=${cn}" \
+            >/dev/null 2>&1 || return 1
+        chmod 600 "$BHTTP_KEY"
+        chmod 644 "$BHTTP_CERT"
+    fi
+    if [[ ! -f "$INSTALL_DIR/conf/hcr_80_cert.pem" || ! -f "$INSTALL_DIR/conf/hcr_80_key.pem" ]]; then
+        openssl req -x509 -newkey rsa:2048 \
+            -keyout "$INSTALL_DIR/conf/hcr_80_key.pem" \
+            -out "$INSTALL_DIR/conf/hcr_80_cert.pem" -days 3650 -nodes \
+            -subj "/CN=${cn}" >/dev/null 2>&1 || return 1
+        chmod 600 "$INSTALL_DIR/conf/hcr_80_key.pem"
+        chmod 644 "$INSTALL_DIR/conf/hcr_80_cert.pem"
+    fi
+}
+
+# Garante a porta publica principal do BHTTP:
+#  - 80 livre (ou ja do VPNManager): usa 80;
+#  - 80 ocupada por outro sistema: nao mexe nela e usa 8080.
+# Chamado pelo instalador e pode ser chamado pelo menu.
+_bhttp_ensure_primary_port(){
+    _bhttp_ensure_certs || return 1
+    _bhttp_setup_sshd
+    _bhttp_ensure_internals
+
+    if ! _bhttp_port_is_busy 80 || _bhttp_port_is_ours 80; then
+        if [[ ! -f /etc/systemd/system/vpnproxy-unified.service ]]; then
+            local fb; fb=$(_bhttp_ensure_fallback)
+            [[ "$fb" == "127.0.0.1:80" ]] && fb=""
+            _bhttp_write_unified_service 80 "127.0.0.1:2223" "$fb"
+        fi
+        systemctl is-active --quiet vpnproxy-unified 2>/dev/null || \
+            systemctl start vpnproxy-unified >/dev/null 2>&1 || true
+        echo "BHTTP principal: porta 80"
+    else
+        local owner; owner=$(_bhttp_port_process 80)
+        echo "AVISO: porta 80 em uso por ${owner:-outro servico}; VPNManager nao mexe nela."
+        echo "BHTTP principal: porta 8080"
+        printf '%s\n' '127.0.0.1:8080' > "$FALLBACK_CONF"
+        _bhttp_ensure_fallback >/dev/null
+        if ! systemctl is-active --quiet vpnproxy-unified-8080 2>/dev/null; then
+            systemctl restart vpnproxy-unified-8080 >/dev/null 2>&1 || true
+        fi
+    fi
+}
+
 # Nome canonico do servico unificado de cada porta.
 _bhttp_svc_name(){
     local porta="$1"
@@ -277,12 +346,26 @@ bhttp_open_port(){
         pause; return
     fi
 
+    # Se a 80 pertence a outro sistema (ex.: dtproto/proto-server), nao a
+    # tocamos: redirecionamos a abertura para a 8080, porta principal aqui.
+    if [[ "$porta" == "80" ]] && _bhttp_port_is_busy 80 && ! _bhttp_port_is_ours 80; then
+        local owner; owner=$(_bhttp_port_process 80)
+        msg "Porta 80 reservada por ${owner:-outro servico}; usando 8080."
+        porta=8080
+    fi
+
     local sn; sn=$(_bhttp_svc_name "$porta")
     if [[ -f "/etc/systemd/system/${sn}.service" ]]; then
+        if [[ "$porta" == "8080" ]]; then
+            systemctl is-active --quiet "$sn" 2>/dev/null || \
+                systemctl restart "$sn" >/dev/null 2>&1 || true
+            ok "Porta 8080 ja e a principal do BHTTP; servico ${sn} ativo."
+            pause; return
+        fi
         fail "${L_BH_ALREADY_OPEN}${porta}"
         pause; return
     fi
-    if ss -tln 2>/dev/null | awk '{print $4}' | grep -q ":${porta}\$"; then
+    if _bhttp_port_is_busy "$porta"; then
         fail "${L_BH_PORT_IN_USE}${porta}"
         pause; return
     fi
@@ -298,6 +381,7 @@ bhttp_open_port(){
     # Nunca aponta a propria porta como fallback (evita loop).
     [[ "$fallback" == "127.0.0.1:${porta}" ]] && fallback=""
 
+    _bhttp_ensure_certs || { fail "Falha ao gerar certificados do BHTTP"; pause; return; }
     _bhttp_setup_sshd
     _bhttp_ensure_internals
     _bhttp_write_service "$porta" "$destino" "$fallback"

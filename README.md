@@ -393,3 +393,45 @@ BHTTP 80 + fallback 19080 + `vpnproxy-ws-8080` com o binário C
 então às 15:59 UTC a stack Go foi restabelecida com o binário `f38283ee…` e
 todas as validações passaram novamente (8/8 silent + 13/13 em cada porta).
 As units Go estão enabled/active; as units antigas permanecem disabled.
+
+### Instalador, menu e bot na VPS com dtproto (26/11/2026)
+
+- `install.sh` agora valida a origem antes de copiar (o instalador rodado de
+  `/root` copiava arquivos inexistentes e deixava só diretórios vazios), copia
+  **todos** os módulos — incluindo `theme.sh`, `ram_clean.sh` e as units do
+  healthcheck — e verifica ao final se `menuvpn` aponta para o menu instalado.
+- `menu.sh`: desinstalação remove somente artefatos do VPNManager, pergunta se
+  os usuários também devem ser removidos (padrão: preservar) e confirma que
+  nada sobrou. Sistemas de terceiros (`proto-server`/dtproto, SSH do sistema,
+  `badvpn@.service`) não são tocados.
+- `bhttp.sh`: se a porta `80` pertence a outro sistema, o VPNManager não a
+  toca e usa a `8080` como porta principal (com `--silent-ws`). Nenhum prompt
+  de fallback: o destino é gravado em `conf/bhttp_fallback.conf`.
+- `port80_stack.sh`: HCR passa a usar `$INSTALL_DIR/bin/hcr-server` (o antigo
+  `/usr/local/bin/hcr-server` era removido no uninstall e deixava a unit em
+  `203/EXEC`). Com `VPNMANAGER_SKIP_PUBLIC=1` cria só os backends internos.
+- `theme.sh` ausente deixava o menu sem cor; o menu agora tem fallback de cores
+  caso o tema não tenha sido copiado.
+- Regra de loopback movida para o topo do `INPUT` (antes de `recent --hitcount`
+  da porta 22), eliminando `packet corrupt` nos proxies locais.
+- Bot Telegram: backup passou a **não incluir binários** (antes passava de
+  20 MB e a Bot API recusava o download), passou a incluir os dados da loja
+  `pm_users.db`, `usuarios.db`, `mercadopago.conf`, `planos.conf`,
+  `msg_entrega.txt`, `clientes.txt`, `test_*.txt`, `test_stats.txt`,
+  `vpnbot_compras.db` e `/tmp/vpnbot_ultimo_teste`) e guarda o documento
+  recebido em `/root/vpnmanager_backups/incoming_restore.tar.gz`, fora do
+  `/tmp`. Download com retry/validação gzip e log em
+  `/var/log/vpnbot_restore.log`.
+- O restore recria os usuários com **o mesmo login, senha e validade** mesmo
+  em máquina sem VPNManager prévio (`/etc/passwd`, `/etc/shadow`, `/etc/group`,
+  `/etc/SSHPlus/senha/<user>` e `chage -E`). Antes de sobrescrever, salva
+  `pre_restore_<ts>.tar.gz` com esses mesmos arquivos.
+- Toda interação com o bot (mensagem, clique ou documento) registra o chat em
+  `clientes.txt`; antes de gerar o backup, a lista é completada com quem já
+  testou, comprou ou está em fluxo pendente, ficando completa para
+  *divulgação/transmissão*.
+
+Validação na VPS `167.126.9.217`: `menuvpn` abre colorido, `hcr-server` e o
+timer ativos, QA `13/13` + `8/8` na `8080`, `proto-server` ativo com
+`sha256` inalterado, uninstall sem deixar artefatos e backup novo com ~30 KB.
+

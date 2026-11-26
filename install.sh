@@ -45,8 +45,19 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Toda a saída do comando vai para $LOG_FILE; em caso de erro,
 # mostra o final do log e aborta.
 
-TOTAL_STEPS=11
+TOTAL_STEPS=14
 CUR_STEP=0
+
+# Arquivos que precisam existir junto do instalador. Sempre que o script
+# e executado fora do diretorio do repo (ex.: /root), a copia falhava
+# silenciosamente e o menu nao abria apos a "instalacao".
+REQUIRED_MODULES=(
+    common.sh ssh_users.sh xray.sh v2ray.sh online_users.sh slowdns.sh
+    badvpn.sh telegram_bot.sh system_info.sh proxy.sh bhttp.sh
+    port80_stack.sh limiter.sh banner.sh outras_opcoes.sh linguagem.sh
+    swap.sh healthcheck.sh sshd_auth_guard.sh theme.sh ram_clean.sh
+    vpnmanager-healthcheck.service vpnmanager-healthcheck.timer
+)
 
 draw_progress(){
     local pct=$(( CUR_STEP * 100 / TOTAL_STEPS ))
@@ -71,6 +82,31 @@ run_step(){
     draw_progress "$desc"
 }
 
+# ── Passo 0: validar o diretorio de origem ─────────────────
+
+step_validate_source(){
+    local missing=() m arch
+    [[ -f "$SCRIPT_DIR/menu.sh" ]] || missing+=("menu.sh")
+    for m in "${REQUIRED_MODULES[@]}"; do
+        [[ -f "$SCRIPT_DIR/modules/$m" ]] || missing+=("modules/$m")
+    done
+    arch="$(uname -m)"
+    case "$arch" in
+        x86_64|amd64) arch="x86_64" ;;
+        aarch64|arm64) arch="aarch64" ;;
+    esac
+    [[ -d "$SCRIPT_DIR/bin/$arch" ]] || missing+=("bin/$arch")
+
+    if (( ${#missing[@]} )); then
+        echo
+        echo -e "${R}[ERRO]${NC} Instalador incompleto em: ${SCRIPT_DIR}"
+        printf '  falta: %s\n' "${missing[@]}" | head -30
+        echo "  Execute install.sh de dentro do diretorio do repositorio VPNManager"
+        echo "  (ex.: cd /tmp/vpnmanager_repo && bash install.sh)."
+        return 1
+    fi
+}
+
 # ── Passo 1: estrutura de diretórios ────────────────────────
 
 step_dirs(){
@@ -83,26 +119,14 @@ step_dirs(){
 # ── Passo 2: copiar módulos ─────────────────────────────────
 
 step_copy_modules(){
-    cp "$SCRIPT_DIR/menu.sh"                 "$INSTALL_DIR/menu.sh"
-    cp "$SCRIPT_DIR/modules/common.sh"       "$INSTALL_DIR/modules/common.sh"
-    cp "$SCRIPT_DIR/modules/ssh_users.sh"    "$INSTALL_DIR/modules/ssh_users.sh"
-    cp "$SCRIPT_DIR/modules/xray.sh"         "$INSTALL_DIR/modules/xray.sh"
-    cp "$SCRIPT_DIR/modules/v2ray.sh"        "$INSTALL_DIR/modules/v2ray.sh"
-    cp "$SCRIPT_DIR/modules/online_users.sh" "$INSTALL_DIR/modules/online_users.sh"
-    cp "$SCRIPT_DIR/modules/slowdns.sh"      "$INSTALL_DIR/modules/slowdns.sh"
-    cp "$SCRIPT_DIR/modules/badvpn.sh"       "$INSTALL_DIR/modules/badvpn.sh"
-    cp "$SCRIPT_DIR/modules/telegram_bot.sh" "$INSTALL_DIR/modules/telegram_bot.sh"
-    cp "$SCRIPT_DIR/modules/system_info.sh"  "$INSTALL_DIR/modules/system_info.sh"
-    cp "$SCRIPT_DIR/modules/proxy.sh"        "$INSTALL_DIR/modules/proxy.sh"
-    cp "$SCRIPT_DIR/modules/bhttp.sh"        "$INSTALL_DIR/modules/bhttp.sh"
-    cp "$SCRIPT_DIR/modules/port80_stack.sh" "$INSTALL_DIR/modules/port80_stack.sh"
-    cp "$SCRIPT_DIR/modules/limiter.sh"      "$INSTALL_DIR/modules/limiter.sh"
-    cp "$SCRIPT_DIR/modules/banner.sh"       "$INSTALL_DIR/modules/banner.sh"
-    cp "$SCRIPT_DIR/modules/outras_opcoes.sh" "$INSTALL_DIR/modules/outras_opcoes.sh"
-    cp "$SCRIPT_DIR/modules/linguagem.sh"     "$INSTALL_DIR/modules/linguagem.sh"
-    cp "$SCRIPT_DIR/modules/swap.sh"          "$INSTALL_DIR/modules/swap.sh"
-    cp "$SCRIPT_DIR/modules/healthcheck.sh"    "$INSTALL_DIR/modules/healthcheck.sh"
-    cp "$SCRIPT_DIR/modules/sshd_auth_guard.sh" "$INSTALL_DIR/modules/sshd_auth_guard.sh"
+    local f
+    for f in menu.sh "${REQUIRED_MODULES[@]/#/modules/}"; do
+        if [[ ! -f "$SCRIPT_DIR/$f" ]]; then
+            echo "ERRO: arquivo ausente no instalador: $SCRIPT_DIR/$f"
+            return 1
+        fi
+        cp "$SCRIPT_DIR/$f" "$INSTALL_DIR/$f"
+    done
     chmod +x "$INSTALL_DIR/menu.sh"
     chmod +x "$INSTALL_DIR/modules/"*.sh
     ln -sf "$INSTALL_DIR/menu.sh" "$BIN_LINK"
@@ -191,7 +215,7 @@ step_proxy_bin(){
     # rename não mexe no inode em uso, só troca a entrada do
     # diretório), diferente de 'cp' direto no destino.
     local name
-    for name in proxy sslproxy xhttpssh checkuser bhttpssh_dtp xhttp2 hcr-server hcr-dispatcher; do
+    for name in proxy sslproxy xhttpssh checkuser bhttpssh_dtp xhttp2 hcr-server hcr-dispatcher vpnproxy-unified; do
         if [[ -f "$src/$name" ]]; then
             cp "$src/$name" "$INSTALL_DIR/bin/${name}.new"
             chmod +x "$INSTALL_DIR/bin/${name}.new"
@@ -202,6 +226,11 @@ step_proxy_bin(){
     for sn in "${was_active[@]}"; do
         systemctl start "$sn" 2>/dev/null || true
     done
+
+    if [[ ! -x "$INSTALL_DIR/bin/vpnproxy-unified" ]]; then
+        echo "ERRO: binario vpnproxy-unified ausente em $src (necessario pelo BHTTP)."
+        return 1
+    fi
 }
 
 # ── Passo 4b: certificados SSL do sslproxy ──────────────────
@@ -232,10 +261,11 @@ step_sslproxy_certs(){
 # esses limites por IP.
 
 step_iptables_lo(){
-    # 1) aceita tudo vindo do loopback (backend dos proxies)
-    if ! iptables -C INPUT -i lo -j ACCEPT 2>/dev/null; then
-        iptables -I INPUT 1 -i lo -j ACCEPT
-    fi
+    # 1) aceita tudo vindo do loopback (backend dos proxies) e garante que
+    #    a regra seja a PRIMEIRA, antes de limites de hitcount/connlimit
+    #    (ex.: regra de 10 conexoes/min na 22 que tambem batia no loopback).
+    iptables -D INPUT -i lo -j ACCEPT 2>/dev/null || true
+    iptables -I INPUT 1 -i lo -j ACCEPT
 
     # 2) remove qualquer connlimit (limite por IP) nas portas comuns
     local p
@@ -257,8 +287,8 @@ step_iptables_lo(){
     # 3) persiste: garante o ACCEPT do loopback e remove os REJECT
     #    connlimit do rules.v4 (mantém o restante intacto)
     if [[ -f /etc/iptables/rules.v4 ]]; then
-        grep -q "^\-A INPUT \-i lo \-j ACCEPT" /etc/iptables/rules.v4 \
-            || sed -i '/^:OUTPUT ACCEPT/a -A INPUT -i lo -j ACCEPT' /etc/iptables/rules.v4
+        sed -i '/^-A INPUT -i lo -j ACCEPT$/d' /etc/iptables/rules.v4
+        sed -i '/^:OUTPUT ACCEPT/a -A INPUT -i lo -j ACCEPT' /etc/iptables/rules.v4
         sed -i '/connlimit.*--reject-with tcp-reset/d' /etc/iptables/rules.v4
     fi
 }
@@ -366,7 +396,8 @@ SVC
         systemctl enable checkuser 2>/dev/null || true
         systemctl start checkuser 2>/dev/null || true
     fi
-    # health-check: reinicia automaticamente servicos que morrerem
+    # health-check: reinicia automaticamente servicos que morrerem.
+    # As units vem do repo via REQUIRED_MODULES (antes nao eram copiadas).
     if [[ -f "$INSTALL_DIR/modules/vpnmanager-healthcheck.service" ]]; then
         cp "$INSTALL_DIR/modules/vpnmanager-healthcheck.service" /etc/systemd/system/ 2>/dev/null || true
         cp "$INSTALL_DIR/modules/vpnmanager-healthcheck.timer" /etc/systemd/system/ 2>/dev/null || true
@@ -374,13 +405,37 @@ SVC
     chmod +x "$INSTALL_DIR/modules/healthcheck.sh" 2>/dev/null || true
     chmod +x "$INSTALL_DIR/modules/sshd_auth_guard.sh" 2>/dev/null || true
     bash "$INSTALL_DIR/modules/sshd_auth_guard.sh" >/dev/null 2>&1 || true
+    timeout 15 systemctl daemon-reload 2>/dev/null || true
     systemctl enable vpnmanager-healthcheck.timer >/dev/null 2>&1 || true
     systemctl start vpnmanager-healthcheck.timer >/dev/null 2>&1 || true
-    timeout 15 systemctl daemon-reload 2>/dev/null || true
 }
 
 # ── Passo 12: stack porta 80 (BHTTP + WebSocket + HCR + XHTTP) ──
 step_port80_stack(){
+    local listener80
+    listener80=$(ss -lntp 2>/dev/null | awk '$4 ~ /:80$/ {print; exit}')
+
+    # Nunca mexemos em servico de outro sistema na 80 (ex.: proto-server/
+    # dtproto). O stack legado tentaria abrir a 80 e entrar em conflito.
+    if [[ -n "$listener80" ]] && ! grep -Eq 'vpnproxy|bhttpssh|hcr-server' <<<"$listener80"; then
+        echo "Porta 80 reservada por outro servico; VPNManager nao a altera."
+        echo "Usando 8080 como porta BHTTP principal."
+        for sn in vpnproxy-bhttp-80 vpnproxy-ws-8080 vpnproxy-hcr-tcp \
+                  vpnproxy-hcr-quic vpnproxy-port80 hcr-dispatcher nginx; do
+            systemctl stop "$sn" >/dev/null 2>&1 || true
+            systemctl disable "$sn" >/dev/null 2>&1 || true
+        done
+        # Cria somente backends internos (sshd-bhttp, HCR, XHTTP).
+        VPNMANAGER_SKIP_PUBLIC=1 bash "$INSTALL_DIR/modules/port80_stack.sh" >/dev/null 2>&1 || true
+        INSTALL_DIR="$INSTALL_DIR" bash -c '
+            source "$1/modules/common.sh"
+            source "$1/modules/linguagem.sh"
+            source "$1/modules/bhttp.sh"
+            _bhttp_ensure_primary_port
+        ' _ "$INSTALL_DIR"
+        return 0
+    fi
+
     if [[ -f "$INSTALL_DIR/modules/port80_stack.sh" ]]; then
         bash "$INSTALL_DIR/modules/port80_stack.sh" >/dev/null 2>&1 || true
     fi
@@ -393,10 +448,32 @@ step_port80_stack(){
     return 0
 }
 
+# ── Passo 13: verificacao final da instalacao ───────────────
+step_verify_install(){
+    local f
+    [[ -x "$INSTALL_DIR/menu.sh" ]] || {
+        echo "ERRO: $INSTALL_DIR/menu.sh nao foi instalado."; return 1;
+    }
+    bash -n "$INSTALL_DIR/menu.sh" || {
+        echo "ERRO: sintaxe invalida em $INSTALL_DIR/menu.sh"; return 1;
+    }
+    for f in menu.sh "${REQUIRED_MODULES[@]/#/modules/}"; do
+        [[ -f "$INSTALL_DIR/$f" ]] || {
+            echo "ERRO: arquivo instalado ausente: $INSTALL_DIR/$f"; return 1;
+        }
+    done
+    [[ "$(readlink -f "$BIN_LINK" 2>/dev/null)" == "$INSTALL_DIR/menu.sh" ]] || \
+        ln -sf "$INSTALL_DIR/menu.sh" "$BIN_LINK"
+    [[ -x "$INSTALL_DIR/bin/vpnproxy-unified" ]] || {
+        echo "ERRO: $INSTALL_DIR/bin/vpnproxy-unified ausente."; return 1;
+    }
+}
+
 # ── Execução ─────────────────────────────────────────────────
 
 echo -e "${C}Instalando VPNManager Lite...${NC}"
 echo
+run_step "Validando origem do instalador"      step_validate_source
 run_step "Criando estrutura de diretórios"     step_dirs
 run_step "Copiando módulos do painel"          step_copy_modules
 run_step "Instalando dependências dos proxies" step_proxy_deps
@@ -409,6 +486,7 @@ run_step "Ajustando sshd_config"               step_ssh_config
 run_step "Reiniciando serviço SSH"             step_ssh_restart
 run_step "Finalizando"                         step_finish
 run_step "Configurando stack port 80 (WebSocket/BHTTP/HCR)" step_port80_stack
+run_step "Verificando instalacao"              step_verify_install
 echo
 echo
 echo -e "${G}[OK]${NC} Instalação concluída!"
@@ -426,8 +504,11 @@ if [[ "$SSH_RESTART_OK" -eq 0 ]]; then
     echo "  Se persistir, um reboot da VPS costuma resolver."
     echo
 fi
-echo -e "  ${C}Porta 80:${NC}  BHTTP + WebSocket + HCR + XHTTP"
-echo -e "  ${C}Porta 8443:${NC} HCR TCP + HCR QUIC (UDP)"
-echo -e "  ${C}UDP 80:${NC}   BHTTP QUIC"
+PRIMARY_PORT=8080
+systemctl is-active --quiet vpnproxy-unified 2>/dev/null && PRIMARY_PORT=80
+echo -e "  ${C}Porta ${PRIMARY_PORT}:${NC} BHTTP + WebSocket + HCR + XHTTP"
+[[ "$PRIMARY_PORT" == 8080 ]] && \
+    echo -e "  ${Y}Porta 80:${NC}   reservada para outro sistema (nao foi alterada)"
+echo -e "  ${C}Interno:${NC}  sshd-bhttp 2223, HCR 18082, XHTTP 11443"
 echo
 echo -e "  Execute: ${G}menuvpn${NC}"

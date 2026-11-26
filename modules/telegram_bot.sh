@@ -78,7 +78,9 @@ SCREEN_MSG_FILE="/tmp/vpnbot_screen_msg"
 PENDING_FILE="/tmp/vpnbot_pending"
 PROMPT_MSG_FILE="/tmp/vpnbot_prompt_msg"
 TESTE_STATE_FILE="/tmp/vpnbot_teste_hours"
-RESTORE_TMP_FILE="/tmp/vpnbot_restore.tar.gz"
+# Arquivo de restore fica fora de /tmp: limpezas de /tmp, reboot ou
+# restart do bot nao podem apagar o backup entre o envio e o "Sim, restaurar".
+RESTORE_TMP_FILE="$BACKUP_DIR/incoming_restore.tar.gz"
 AUTO_BACKUP_CONF="${INSTALL_DIR}/conf/autobackup.conf"
 AUTO_BACKUP_INTERVAL=21600
 HEADEREOF
@@ -218,6 +220,28 @@ _registra_cliente(){
     if ! grep -q "^${chat}|" "$CLIENTES_FILE" 2>/dev/null; then
         echo "${chat}|${uname}|$(date +%d/%m/%Y)" >> "$CLIENTES_FILE"
     fi
+}
+
+# Completa a lista de transmissão com o histórico que o bot já registrou
+# em outras fontes (testes e compras), além dos que interagem agora.
+_sync_clientes_lista(){
+    mkdir -p "$(dirname "$CLIENTES_FILE")"
+    touch "$CLIENTES_FILE"
+    if [[ -f "$TEST_STATS_FILE" ]]; then
+        while IFS='|' read -r c u rest; do
+            [[ -n "$c" ]] && _registra_cliente "$c" "$u"
+        done < "$TEST_STATS_FILE"
+    fi
+    if [[ -f "$COMPRAS_DB" ]]; then
+        while IFS='|' read -r dt c rest; do
+            [[ "$c" =~ ^[0-9]+$ ]] && _registra_cliente "$c" ""
+        done < "$COMPRAS_DB"
+    fi
+    for f in /tmp/vpnbot_cli_*; do
+        [[ -f "$f" ]] || continue
+        c="${f##*_}"
+        [[ "$c" =~ ^[0-9]+$ ]] && _registra_cliente "$c" ""
+    done
 }
 
 # escapa caracteres especiais do Markdown (Telegram) em textos dinâmicos
@@ -696,14 +720,46 @@ Nenhuma compra ainda."
 # $1 = file_id   $2 = caminho local de destino
 tg_download_file(){
     local file_id="$1" dest="$2"
-    local info; info=$(curl -s --max-time 12 "${API}/getFile?file_id=${file_id}")
-    local file_path; file_path=$(echo "$info" | python3 -c "import sys,json
+    local info file_path code="" attempt rc=1
+    local log="/var/log/vpnbot_restore.log"
+
+    rm -f "$dest"
+    echo "$(date '+%Y-%m-%d %H:%M:%S') DOWNLOAD start file_id=${file_id:0:24} dest=$dest" >> "$log" 2>/dev/null || true
+
+    for attempt in 1 2; do
+        info=$(curl -s --max-time 25 "${API}/getFile?file_id=${file_id}" 2>>"$log")
+        file_path=$(echo "$info" | python3 -c "import sys,json
 try:
     print(json.load(sys.stdin).get('result',{}).get('file_path',''))
 except Exception:
     print('')" 2>/dev/null)
-    [[ -z "$file_path" ]] && return 1
-    curl -s --max-time 30 -o "$dest" "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}"
+        if [[ -z "$file_path" ]]; then
+            echo "$(date '+%Y-%m-%d %H:%M:%S') DOWNLOAD falha getFile tentativa=$attempt resp=${info:0:200}" >> "$log" 2>/dev/null || true
+            sleep 2
+            continue
+        fi
+
+        code=$(curl -sS -L --max-time 120 -o "$dest" \
+            -w '%{http_code}' \
+            "https://api.telegram.org/file/bot${BOT_TOKEN}/${file_path}" 2>>"$log")
+        rc=$?
+        echo "$(date '+%Y-%m-%d %H:%M:%S') DOWNLOAD tentativa=$attempt http=${code:-0} rc=$rc bytes=$(stat -c %s "$dest" 2>/dev/null || echo 0)" >> "$log" 2>/dev/null || true
+
+        # So aceita HTTP 200 com conteudo gzip valido (cabecalho 1f 8b).
+        if [[ "$code" == "200" && -s "$dest" ]]; then
+            local magic; magic=$(head -c 2 "$dest" | od -An -tx1 | tr -d ' \n')
+            [[ "$magic" == "1f8b" ]] && { rc=0; break; }
+            echo "$(date '+%Y-%m-%d %H:%M:%S') DOWNLOAD arquivo nao e gzip (magic=$magic)" >> "$log" 2>/dev/null || true
+        fi
+        rm -f "$dest"
+        sleep 2
+    done
+
+    if (( rc != 0 )); then
+        echo "$(date '+%Y-%m-%d %H:%M:%S') DOWNLOAD FALHOU apos 2 tentativas" >> "$log" 2>/dev/null || true
+        return 1
+    fi
+    return 0
 }
 
 extract_msg_id(){
@@ -1194,6 +1250,8 @@ do_remover(){
 
 do_backup(){
     mkdir -p "$BACKUP_DIR"
+    # garante que a lista de transmissão inclua todo mundo que já usou o bot
+    _sync_clientes_lista
     local ts; ts=$(date +%Y%m%d_%H%M%S)
     local file="$BACKUP_DIR/vpnbackup_$ts.tar.gz"
 
@@ -1206,11 +1264,23 @@ do_backup(){
         /etc/group
         /etc/ssh/sshd_config
         /root/pm_users.db
+        /root/usuarios.db
         /etc/SSHPlus
         /usr/local/etc/xray/config.json
         /usr/local/etc/v2ray/config.json
         "$INSTALL_DIR/conf"
-        "$INSTALL_DIR/bin"
+        # Binarios nao entram: o painel os reinstala. Inclui-los fazia o
+        # backup passar de 20 MB e o Telegram nao deixava o bot baixar.
+        # Loja & Vendas — tudo do painel: compradores, testes, Mercado Pago,
+        # planos, mensagem de entrega, clientes e usuarios com validades.
+        /root/vpnbot_compras.db
+        "$INSTALL_DIR/conf/mercadopago.conf"
+        "$INSTALL_DIR/conf/planos.conf"
+        "$INSTALL_DIR/conf/msg_entrega.txt"
+        "$INSTALL_DIR/conf/clientes.txt"
+        "$INSTALL_DIR/conf/telegram_bot.conf"
+        "$INSTALL_DIR/conf"/test_*.txt
+        /tmp/vpnbot_ultimo_teste
         /etc/systemd/system/vpnproxy-*.service
         /etc/systemd/system/badvpn-*.service
     )
@@ -1224,10 +1294,19 @@ do_backup(){
     tar -czf "$file" "${paths[@]}" 2>/dev/null
 
     if [[ -f "$file" ]]; then
+        local size; size=$(stat -c %s "$file" 2>/dev/null || echo 0)
+        # Limite da Bot API do Telegram para download: 20 MB.
+        if (( size > 20971520 )); then
+            rm -f "$file"
+            echo "❌ Backup gerado com $(( size / 1048576 )) MB (acima do limite de 20 MB do Telegram)."
+            return
+        fi
         tg_send_file "$file" "🗂 Backup completo $ts"
-        echo "✅ *Backup enviado:* \`vpnbackup_$ts.tar.gz\`
+        echo "✅ *Backup enviado:* \`vpnbackup_$ts.tar.gz\` ($(( size / 1048576 )) MB)
 
-Inclui usuários SSH (e senhas), limites, configurações e credenciais Xray/V2Ray, portas abertas e ajustes do SSH.
+Inclui usuários SSH (mesmo login, senha e validade, via passwd/shadow/SSHPlus), limites, configurações, credenciais Xray/V2Ray e **tudo da Loja & Vendas**: todos os que compraram, todos os que testaram, Mercado Pago, planos, mensagem de entrega, clientes, compras e a lista de *todos que já usaram o bot* para transmissão. Inclui também portas abertas e ajustes do SSH.
+
+Binários do painel não são incluídos (são reinstalados), para o arquivo caber no limite do Telegram.
 
 Envie este arquivo de volta pra mim quando quiser restaurar."
     else
@@ -1241,7 +1320,10 @@ do_restore(){
     local tarfile="$1"
 
     if [[ ! -f "$tarfile" ]]; then
-        echo "❌ Arquivo de backup não encontrado (pode ter expirado). Envie novamente."
+        echo "$(date '+%Y-%m-%d %H:%M:%S') RESTORE arquivo ausente: $tarfile" >> /var/log/vpnbot_restore.log 2>/dev/null || true
+        echo "❌ Arquivo de backup não encontrado em $tarfile.
+
+Envie o .tar.gz novamente e, quando o bot perguntar, toque em ✅ Sim, restaurar."
         return
     fi
 
@@ -1251,14 +1333,17 @@ do_restore(){
         return
     fi
 
+    echo "$(date '+%Y-%m-%d %H:%M:%S') RESTORE inicio arquivo=$tarfile" >> /var/log/vpnbot_restore.log 2>/dev/null || true
+
     # backup de segurança do estado atual, antes de sobrescrever
     mkdir -p "$BACKUP_DIR"
     local ts; ts=$(date +%Y%m%d_%H%M%S)
     tar -czf "$BACKUP_DIR/pre_restore_$ts.tar.gz" \
-        /etc/passwd /etc/shadow /etc/group \
-        "$PM_DB" "$INSTALL_DIR/conf" 2>/dev/null
+        /etc/passwd /etc/shadow /etc/group /etc/ssh/sshd_config \
+        /etc/SSHPlus /root/usuarios.db \
+        "$PM_DB" "$COMPRAS_DB" "$INSTALL_DIR/conf" 2>/dev/null
 
-    tar -xzf "$tarfile" -C / 2>/dev/null
+    tar -xzf "$tarfile" -C / 2>>/var/log/vpnbot_restore.log
     local rc=$?
     rm -f "$tarfile"
 
@@ -1271,10 +1356,20 @@ do_restore(){
         systemctl restart "$(basename "$svc" .service)" 2>/dev/null
     done
 
+    # A loja le planos/token do Mercado Pago na inicializacao do worker.
+    # Reinicia o bot com atraso para nao cortar a resposta desta acao.
+    nohup bash -c 'sleep 6; systemctl restart vpnbot' >/dev/null 2>&1 &
+
+    echo "$(date '+%Y-%m-%d %H:%M:%S') RESTORE fim rc=$rc pre=pre_restore_$ts.tar.gz" >> /var/log/vpnbot_restore.log 2>/dev/null || true
+
     if [[ $rc -eq 0 ]]; then
         echo "✅ *Backup restaurado com sucesso!*
 
-Usuários SSH, senhas, limites, configurações e credenciais Xray/V2Ray foram restaurados. Serviços reiniciados.
+Usuários SSH *com o mesmo login, senha e validade* (/etc/passwd, /etc/shadow, /etc/SSHPlus e `chage`), limites, configurações e credenciais Xray/V2Ray foram restaurados — mesmo em uma máquina onde o VPNManager ainda não existia.
+
+Tudo da *Loja & Vendas* também voltou: todos os que compraram, todos os que testaram, Mercado Pago, planos, mensagem de entrega, clientes, compras e a lista completa de quem já usou o bot (para divulgação/transmissão).
+
+O bot será reiniciado em instantes para aplicar as configurações da loja.
 
 Uma cópia de segurança do estado anterior foi salva em \`pre_restore_$ts.tar.gz\`."
     else
@@ -1536,6 +1631,12 @@ $out" > /dev/null 2>&1
             cb_chat=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('callback_query',{}).get('message',{}).get('chat',{}).get('id',''))" 2>/dev/null)
             cb_data=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('callback_query',{}).get('data',''))" 2>/dev/null)
 
+            # Todo clique no bot entra na lista de divulgação/transmissão.
+            if [[ -n "$cb_chat" ]]; then
+                cb_uname_all=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('callback_query',{}).get('from',{}).get('username',''))" 2>/dev/null)
+                _registra_cliente "$cb_chat" "$cb_uname_all"
+            fi
+
             # ── loja: compra / renovação de clientes (qualquer chat) ──
             case "$cb_data" in
                 buy_*)
@@ -1735,10 +1836,23 @@ Responda: \`dias\` ou \`meses\`"
 
         # ── documento enviado (possível backup para restaurar) ──
         doc_chat=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('chat',{}).get('id',''))" 2>/dev/null)
+        # Quem envia qualquer coisa pro bot tambem entra na transmissao.
+        [[ -n "$doc_chat" ]] && _registra_cliente "$doc_chat" ""
         doc_file_id=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('document',{}).get('file_id',''))" 2>/dev/null)
 
         if [[ -n "$doc_file_id" && "$doc_chat" == "$BOT_CHAT_ID" ]]; then
             doc_name=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('document',{}).get('file_name',''))" 2>/dev/null)
+            doc_size=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('document',{}).get('file_size',0))" 2>/dev/null)
+
+            # A Bot API do Telegram nao consegue baixar arquivos > 20 MB.
+            # Avisa antes para nao pedir "envie novamente" sem explicacao.
+            if [[ "${doc_size:-0}" =~ ^[0-9]+$ ]] && (( doc_size > 20971520 )); then
+                echo "$(date '+%Y-%m-%d %H:%M:%S') DOC gigante ${doc_size}B name=${doc_name}" >> /var/log/vpnbot_restore.log 2>/dev/null || true
+                tg_send "❌ O arquivo tem $(( doc_size / 1048576 )) MB. O Telegram não permite o bot baixar arquivos acima de 20 MB.
+
+Gere um novo backup com /backup (ou 📦 Gerar backup agora) e envie esse arquivo. A versão nova não inclui os binários e fica bem menor." > /dev/null 2>&1
+                continue
+            fi
 
             if tg_download_file "$doc_file_id" "$RESTORE_TMP_FILE" && [[ -s "$RESTORE_TMP_FILE" ]]; then
                 tg_send_kb "📦 Arquivo recebido: \`${doc_name:-backup}\`
@@ -1752,6 +1866,13 @@ Deseja *restaurar* este backup agora? Isso vai sobrescrever usuários SSH, senha
 
         # ── mensagem de texto normal ──
         from_chat=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('chat',{}).get('id',''))" 2>/dev/null)
+
+        # Registra TODO mundo que ja usou o bot (nao só /start), inclusive
+        # mensagens soltas — a lista de transmissao fica completa no backup.
+        if [[ -n "$from_chat" ]]; then
+            from_uname=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('from',{}).get('username',''))" 2>/dev/null)
+            _registra_cliente "$from_chat" "$from_uname"
+        fi
 
         text=$(echo "$update" | python3 -c "import sys,json; print(json.load(sys.stdin).get('message',{}).get('text',''))" 2>/dev/null)
         [[ -z "$text" ]] && continue
@@ -1946,7 +2067,7 @@ CONF
 
     mkdir -p "$BACKUP_DIR"
     # limpa estado de navegação de uma instalação anterior
-    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz /tmp/vpnbot_pix_pending /tmp/vpnbot_cli_* /tmp/vpnbot_plan_unit /tmp/vpnbot_plan_qtd /tmp/vpnbot_pix_polling
+    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz "$BACKUP_DIR/incoming_restore.tar.gz" /tmp/vpnbot_pix_pending /tmp/vpnbot_cli_* /tmp/vpnbot_plan_unit /tmp/vpnbot_plan_qtd /tmp/vpnbot_pix_polling
 
     _write_bot_worker "$token" "$chat_id"
     _write_bot_service
@@ -1992,7 +2113,7 @@ telegram_bot_uninstall(){
     rm -f "$BOT_SERVICE" "$BOT_SCRIPT" "$BOT_CONF" "$BOT_OFFSET_FILE" "$AUTO_BACKUP_CONF"
     rm -f "$INSTALL_DIR/conf/mercadopago.conf" "$INSTALL_DIR/conf/planos.conf" "$INSTALL_DIR/conf/msg_entrega.txt"
     rm -f /root/vpnbot_compras.db /tmp/vpnbot_pix_pending /tmp/vpnbot_cli_* /tmp/vpnbot_plan_unit /tmp/vpnbot_plan_qtd /tmp/vpnbot_pix_polling
-    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz
+    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz "$BACKUP_DIR/incoming_restore.tar.gz"
     systemctl daemon-reload
     ok "Bot removido."
     pause
@@ -2038,7 +2159,7 @@ telegram_bot_menu(){
         if bot_is_configured; then
             case $op in
                 1)
-                    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz /tmp/vpnbot_pix_pending /tmp/vpnbot_cli_* /tmp/vpnbot_plan_unit /tmp/vpnbot_plan_qtd /tmp/vpnbot_pix_polling
+                    rm -f /tmp/vpnbot_screen_msg /tmp/vpnbot_pending /tmp/vpnbot_prompt_msg /tmp/vpnbot_teste_hours /tmp/vpnbot_restore.tar.gz "$BACKUP_DIR/incoming_restore.tar.gz" /tmp/vpnbot_pix_pending /tmp/vpnbot_cli_* /tmp/vpnbot_plan_unit /tmp/vpnbot_plan_qtd /tmp/vpnbot_pix_polling
                     systemctl restart vpnbot && ok "Reiniciado." || fail "Erro."
                     sleep 2
                     ;;

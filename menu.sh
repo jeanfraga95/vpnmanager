@@ -21,6 +21,34 @@ source "$INSTALL_DIR/modules/bhttp.sh"
 source "$INSTALL_DIR/modules/outras_opcoes.sh"
 source "$INSTALL_DIR/modules/swap.sh"
 
+# ── Cores do menu (fallback) ──────────────────────────────────
+# O tema fica em modules/theme.sh e e carregado por common.sh. Se o
+# instalador antigo nao copiou esse arquivo, o menu abria sem nenhuma
+# cor. Define aqui os mesmos codigos para o menu continuar colorido.
+if [[ -z "${C_NC:-}" ]]; then
+    C_RESET='\033[0m'
+    C_NC="$C_RESET"
+    C_BG=''
+    C_BG_SOFT='\033[48;5;24m'
+    C_TEXT=''
+    C_ORANGE='\033[38;5;208m'
+    C_AMBER='\033[38;5;214m'
+    C_BORDER='\033[1;34m'
+    C_BLUE="$C_BORDER"
+    C_CYAN='\033[1;36m'
+    C_WHITE='\033[1;38;5;255m'
+    C_GRAY='\033[38;5;245m'
+    C_DIM='\033[38;5;244m'
+    C_BAR='\033[44m'
+    C_GREEN='\033[38;5;120m'
+    C_YELLOW='\033[38;5;214m'
+    C_RED='\033[38;5;209m'
+    C_BOLD='\033[1m'
+    C_LIGHTGREEN="$C_GREEN"
+    C_LIGHTRED="$C_RED"
+    C_LIGHTCYAN="$C_CYAN"
+fi
+
 _lang_load
 
 for fn in ssh_users_menu xray_menu xray_is_installed \
@@ -421,6 +449,18 @@ auto_menu_toggle_screen(){
 
 # ── Uninstall ─────────────────────────────────────────────────
 
+# Remove uma unidade apenas se ela for claramente do VPNManager.
+# Servicos de outros sistemas (ex.: proto-server/dtproto, badvpn de outro
+# painel) nunca sao tocados.
+_vpnmanager_unit_remove(){
+    local u="$1" f="/etc/systemd/system/${u}.service"
+    [[ -f "$f" ]] || return 0
+    if grep -Eq '/etc/VPNManager|VPNManager' "$f" 2>/dev/null; then
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+        rm -f "$f"
+    fi
+}
+
 full_uninstall(){
     clear
     _sep_line
@@ -428,12 +468,10 @@ full_uninstall(){
     _sep_line
     echo
     echo " ${L_UNINST_MSG}"
-    echo -e "  ${C_DIM}• ${L_UNINST_USERS}${C_NC}"
-    echo -e "  ${C_DIM}• ${L_UNINST_TOOLS}${C_NC}"
-    echo -e "  ${C_DIM}• ${L_UNINST_BOT}${C_NC}"
-    echo -e "  ${C_DIM}• ${L_UNINST_PORTS}${C_NC}"
-    echo -e "  ${C_DIM}• ${L_UNINST_MENU}${C_NC}"
-    echo -e "  ${C_DIM}• ${L_UNINST_AUTO}${C_NC}"
+    echo -e "  ${C_DIM}• Menu, modulos, binarios e configuracoes${C_NC}"
+    echo -e "  ${C_DIM}• Servicos vpnproxy / HCR / sshd-bhttp / healthcheck${C_NC}"
+    echo -e "  ${C_DIM}• Usuarios: preservados por padrao (pergunta abaixo)${C_NC}"
+    echo -e "  ${C_DIM}• Sistemas de terceiros (ex.: dtproto/proto-server): intactos${C_NC}"
     echo
     echo -e " ${C_LIGHTRED}${L_UNINST_WARN}${C_NC}"
     echo
@@ -441,34 +479,84 @@ full_uninstall(){
     if [[ "$conf" != "DESINSTALAR" && "$conf" != "UNINSTALL" ]]; then
         fail "Confirmacao incorreta."; pause; return
     fi
+
+    local remove_users=0
     echo
-    msg "Removendo usuarios SSH..."
-    while IFS=: read -r uname _ uid _ _ _ shell; do
-        [[ "$uid" -ge 1000 && "$shell" == "/bin/false" ]] || continue
-        ssh_remove_api "$uname" > /dev/null 2>&1
-    done < <(sort -t: -k1,1 /etc/passwd)
-    msg "Removendo Bot Telegram..."
-    systemctl disable --now vpnbot 2>/dev/null
-    rm -f "$BOT_SERVICE" "$BOT_SCRIPT" "$BOT_CONF" "$BOT_OFFSET_FILE" "$AUTO_BACKUP_CONF" 2>/dev/null
-    msg "Removendo Limitador..."
-    systemctl disable --now vpnlimiter 2>/dev/null
-    rm -f "$LIMITER_SERVICE" "$LIMITER_SCRIPT" "$LIMITER_CONF" 2>/dev/null
-    msg "Removendo SlowDNS..."
-    systemctl disable --now slowdns 2>/dev/null; rm -f "$SDNS_SERVICE" /usr/local/bin/dnstt-server 2>/dev/null; rm -rf "$SDNS_DIR" 2>/dev/null
-    msg "Removendo BadVPN..."
-    _stop_all_badvpn 2>/dev/null; apt-get remove -y badvpn > /dev/null 2>&1 || true
-    msg "Fechando portas WS/TLS-SSL/XHTTP..."
-    for svc in /etc/systemd/system/vpnproxy-*.service; do
-        [[ -f "$svc" ]] || continue; systemctl disable --now "$(basename "$svc" .service)" 2>/dev/null; rm -f "$svc"
+    read -p " Remover tambem os usuarios criados pelo painel? [s/N]: " conf2
+    [[ "$conf2" =~ ^[sS]$ ]] && remove_users=1
+
+    echo
+    msg "Parando e removendo servicos do VPNManager..."
+    local u f sn left=()
+    for u in sshd-bhttp hcr-server vpnproxy-xhttp-11443 vpnproxy-fallback \
+             vpnproxy-ws-8080 vpnproxy-bhttp-80 checkuser; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${u}.service"
     done
-    msg "Removendo Xray e V2Ray..."
-    xray_full_uninstall 2>/dev/null; v2ray_full_uninstall 2>/dev/null
-    msg "Removendo Banner SSH..."
-    rm -f /etc/bannerssh 2>/dev/null; _banner_set_sshd_directive "none" 2>/dev/null; systemctl restart ssh 2>/dev/null
-    systemctl daemon-reload 2>/dev/null
-    msg "Removendo menu..."
-    auto_menu_disable; rm -f "$BIN_LINK"; rm -rf /etc/SSHPlus /etc/PanelMaster /etc/usuarios 2>/dev/null; rm -f /root/pm_users.db 2>/dev/null
-    clear; echo -e "${C_LIGHTGREEN}${L_UNINST_OK}${C_NC}"; rm -rf "$INSTALL_DIR"; exit 0
+    for u in vpnmanager-healthcheck.timer vpnmanager-healthcheck.service; do
+        systemctl disable --now "$u" >/dev/null 2>&1 || true
+        rm -f "/etc/systemd/system/${u}"
+    done
+    for f in /etc/systemd/system/vpnproxy-*.service; do
+        [[ -f "$f" ]] || continue
+        sn=$(basename "$f" .service)
+        systemctl disable --now "$sn" >/dev/null 2>&1 || true
+        rm -f "$f"
+    done
+    rm -rf /etc/systemd/system/vpnproxy-*.service.d
+
+    # Modulos opcionais: só removemos se a unit apontar para o VPNManager.
+    for u in vpnbot vpnlimiter slowdns xray v2ray; do
+        _vpnmanager_unit_remove "$u"
+    done
+    rm -f "$BOT_SERVICE" "$BOT_SCRIPT" "$BOT_CONF" "$BOT_OFFSET_FILE" "$AUTO_BACKUP_CONF" 2>/dev/null
+    rm -f "$LIMITER_SERVICE" "$LIMITER_SCRIPT" "$LIMITER_CONF" 2>/dev/null
+    rm -f "$SDNS_SERVICE" /usr/local/bin/dnstt-server 2>/dev/null
+    rm -rf "$SDNS_DIR" 2>/dev/null
+
+    msg "Removendo arquivos do VPNManager..."
+    auto_menu_disable 2>/dev/null || true
+    rm -rf "$INSTALL_DIR"
+    rm -f "$BIN_LINK"
+    rm -f /etc/ssh/sshd_config_bhttp
+    rm -f /usr/local/bin/hcr-server /usr/local/bin/hcr-dispatcher /usr/local/bin/checkuser
+    rm -rf /opt/magnumproxy
+    rm -f /etc/bannerssh 2>/dev/null
+    _banner_set_sshd_directive "none" 2>/dev/null || true
+
+    if (( remove_users )); then
+        msg "Removendo usuarios criados pelo painel..."
+        while IFS=: read -r uname _ uid _ _ _ shell; do
+            [[ "$uid" -ge 1000 && "$shell" == "/bin/false" ]] || continue
+            ssh_remove_api "$uname" > /dev/null 2>&1
+        done < <(sort -t: -k1,1 /etc/passwd)
+        rm -rf /etc/SSHPlus /etc/PanelMaster /etc/usuarios 2>/dev/null
+        rm -f /root/pm_users.db 2>/dev/null
+    else
+        echo "  Usuarios preservados."
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # Verificação: nada do VPNManager pode sobrar (exceto usuarios, se escolhido).
+    [[ -e "$INSTALL_DIR" || -L "$INSTALL_DIR" ]] && left+=("$INSTALL_DIR")
+    [[ -e "$BIN_LINK" || -L "$BIN_LINK" ]] && left+=("$BIN_LINK")
+    for f in /etc/systemd/system/vpnproxy-*.service \
+             /etc/systemd/system/vpnproxy-*.service.d \
+             /etc/systemd/system/sshd-bhttp.service \
+             /etc/systemd/system/hcr-server.service \
+             /etc/systemd/system/checkuser.service \
+             /etc/systemd/system/vpnmanager-healthcheck.*; do
+        [[ -e "$f" ]] && left+=("$f")
+    done
+    if (( ${#left[@]} )); then
+        echo -e " ${C_LIGHTRED}[AVISO]${C_NC} Restaram artefatos do VPNManager:"
+        printf '   %s\n' "${left[@]}" | head -20
+    else
+        echo -e " ${C_GREEN}[OK]${C_NC} Nenhum artefato do VPNManager restou."
+    fi
+
+    clear; echo -e "${C_LIGHTGREEN}${L_UNINST_OK}${C_NC}"; exit 0
 }
 
 # ── Menu items ────────────────────────────────────────────────
