@@ -444,6 +444,7 @@ type Session struct {
 	bannerBy    net.Conn  // conexao TCP que entregou o 1o upload do ciclo
 	firstUp     []byte    // conteudo desse primeiro upload
 	last        time.Time
+	created     time.Time // criacao: base do reaper de zumbis sem trafego real
 	// contadores de bytes por ciclo (telemetria de gargalo)
 	dlInBytes   int64 // bytes recebidos de sshd (readLoop)
 	dlOutBytes  int64 // bytes servidos ao app (getChunk)
@@ -540,6 +541,7 @@ func getOrCreateSession(key [16]byte, dest string, ip string) *Session {
 		dlPending: map[int64]struct{}{},
 		upQ:       make(chan upItem, 8192),
 		last:      time.Now(),
+		created:   time.Now(),
 	}
 	s.cond = sync.NewCond(&s.mu)
 	registry.m[ks] = s
@@ -2026,7 +2028,18 @@ func reaper() {
 		var candidates []sinfo // candidatas a trim por excesso de dlBuf (ordinario + pressao de RAM)
 		for _, s := range registry.m {
 			s.mu.Lock()
-			if time.Since(s.last) > *flagIdle {
+			// s.last e atualizado por QUALQUER frame, inclusive o polling
+			// de conexoes que o app abandonou — nao serve para medir uso.
+			// Usa bytes REAIS de upload/download (ou a criacao) para nao
+			// acumular sessoes/sshd que ninguem mais esta usando.
+			lastAct := s.created
+			if s.lastDLAdvance.After(lastAct) {
+				lastAct = s.lastDLAdvance
+			}
+			if s.lastUpWrite.After(lastAct) {
+				lastAct = s.lastUpWrite
+			}
+			if time.Since(lastAct) > *flagIdle {
 				stale = append(stale, s)
 			}
 			if !s.firstPendAt.IsZero() && s.bannerBy != nil &&

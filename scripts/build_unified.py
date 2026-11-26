@@ -300,6 +300,17 @@ if os.path.exists(PATCH8):
 else:
     print('AVISO: patch dl-burst nao encontrado:', PATCH8)
 
+# 3i) stale-reap: zombies nao podem ser mantidos vivos por polling.
+PATCH9 = os.path.join(SCRIPTS, 'apply_stale_reap.py')
+if os.path.exists(PATCH9):
+    import importlib.util
+    _spec9 = importlib.util.spec_from_file_location('apply_stale_reap', PATCH9)
+    _mod9 = importlib.util.module_from_spec(_spec9)
+    _spec9.loader.exec_module(_mod9)
+    _mod9.apply(DST + '/main.go')
+else:
+    print('AVISO: patch stale-reap nao encontrado:', PATCH9)
+
 # gofmt para manter o fonte versionado estavel entre rebuilds.
 import subprocess
 subprocess.check_call(['/usr/local/go/bin/gofmt', '-w',
