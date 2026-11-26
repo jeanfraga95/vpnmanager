@@ -2,7 +2,10 @@
 # Gera /tmp/vpnfull/src/vpnproxy a partir de bhttpssh + proxygo, sem tocar nos originais.
 import os, re, shutil, sys
 
-ROOT = '/tmp/vpnfull/src'
+# Raiz derivada da localizacao do script: o build funciona tanto em
+# /tmp/vpnfull quanto em /tmp/vpnmanager_repo (ou qualquer checkout).
+SCRIPTS = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.abspath(os.path.join(SCRIPTS, '..', 'src'))
 DST  = ROOT + '/vpnproxy'
 WS   = DST + '/internal/wsproxy'
 
@@ -220,7 +223,7 @@ for f in ('main.go', 'dtproto.go', 'dispatch.go', 'go.mod', 'internal/wsproxy/ws
     print(' ', f, os.path.getsize(DST + '/' + f))
 
 # 3) patch reprodutivel --silent-ws (comportamento do proxy C na 8080).
-PATCH = '/tmp/vpnfull/scripts/apply_silent_ws.py'
+PATCH = os.path.join(SCRIPTS, 'apply_silent_ws.py')
 if os.path.exists(PATCH):
     ns = {'DST': DST, '__name__': '__main__'}
     exec(compile(open(PATCH).read(), PATCH, 'exec'), ns)
@@ -228,7 +231,7 @@ else:
     print('AVISO: patch silent-ws nao encontrado:', PATCH)
 
 # 3b) patch reprodutivel do caminho silent sem 200 extra (proxyjf-like).
-PATCH2 = '/tmp/vpnfull/scripts/apply_nomagic200.py'
+PATCH2 = os.path.join(SCRIPTS, 'apply_nomagic200.py')
 if os.path.exists(PATCH2):
     ns2 = {'DST': DST, '__name__': '__main__'}
     exec(compile(open(PATCH2).read(), PATCH2, 'exec'), ns2)
@@ -237,7 +240,7 @@ else:
 
 # 3c) patch reprodutivel da ordenacao de batches (packet corrupt com
 # batch=true + multiplas conexoes): mesmo turno dlPending/minK do getChunk.
-PATCH3 = '/tmp/vpnfull/scripts/apply_batch_order.py'
+PATCH3 = os.path.join(SCRIPTS, 'apply_batch_order.py')
 if os.path.exists(PATCH3):
     import importlib.util
     _spec = importlib.util.spec_from_file_location('apply_batch_order', PATCH3)
