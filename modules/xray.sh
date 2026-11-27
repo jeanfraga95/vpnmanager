@@ -91,18 +91,25 @@ generate_selfsigned_cert(){
     mkdir -p "$XRAY_SSL_DIR"
     if [[ -s "$XRAY_SSL_DIR/cert.pem" && -s "$XRAY_SSL_DIR/priv.key" ]]; then
         ok "Certificado autoassinado já existe. Reaproveitando."
-        return 0
+    else
+        msg "Gerando certificado autoassinado (válido por 10 anos)..."
+        if ! openssl req -x509 -nodes -newkey rsa:2048 \
+            -keyout "$XRAY_SSL_DIR/priv.key" \
+            -out "$XRAY_SSL_DIR/cert.pem" \
+            -days 3650 \
+            -subj "/CN=$ip" \
+            -addext "subjectAltName=IP:$ip" >/tmp/cert_gen.log 2>&1; then
+            fail "Falha ao gerar certificado. Detalhes:"
+            cat /tmp/cert_gen.log
+            return 1
+        fi
     fi
-    msg "Gerando certificado autoassinado (válido por 10 anos)..."
-    if ! openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout "$XRAY_SSL_DIR/priv.key" \
-        -out "$XRAY_SSL_DIR/cert.pem" \
-        -days 3650 \
-        -subj "/CN=$ip" \
-        -addext "subjectAltName=IP:$ip" >/tmp/cert_gen.log 2>&1; then
-        fail "Falha ao gerar certificado. Detalhes:"
-        cat /tmp/cert_gen.log
-        return 1
+
+    # Xray 26.x roda com User=xray (versoes antigas usavam nobody): a chave
+    # gerada por root com modo 600 impede o serviço de ler o certificado.
+    if id xray >/dev/null 2>&1; then
+        chown root:xray "$XRAY_SSL_DIR/priv.key" 2>/dev/null || true
+        chmod 640 "$XRAY_SSL_DIR/priv.key" 2>/dev/null || true
     fi
     return 0
 }
