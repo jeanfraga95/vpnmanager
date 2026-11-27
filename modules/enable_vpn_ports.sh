@@ -56,6 +56,8 @@ _port_owner(){
     if [[ -n "$pid" && -r "/proc/$pid/exe" ]]; then
         exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
         if [[ -n "$exe" ]]; then
+            # binario substituido/apagado aparece como "/usr/bin/stunnel4 (deleted)"
+            exe=${exe% \(deleted\)}
             basename "$exe"
             return 0
         fi
