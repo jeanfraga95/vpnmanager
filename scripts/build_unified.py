@@ -311,6 +311,18 @@ if os.path.exists(PATCH9):
 else:
     print('AVISO: patch stale-reap nao encontrado:', PATCH9)
 
+# 3j) dtproto-lifecycle: idle 120s, fila de upload por bytes e orcamento
+# global de dlBuf com trim das sessoes menos ativas primeiro.
+PATCH10 = os.path.join(SCRIPTS, 'apply_dtproto_lifecycle.py')
+if os.path.exists(PATCH10):
+    import importlib.util
+    _spec10 = importlib.util.spec_from_file_location('apply_dtproto_lifecycle', PATCH10)
+    _mod10 = importlib.util.module_from_spec(_spec10)
+    _spec10.loader.exec_module(_mod10)
+    _mod10.apply(DST + '/main.go')
+else:
+    print('AVISO: patch dtproto-lifecycle nao encontrado:', PATCH10)
+
 # gofmt para manter o fonte versionado estavel entre rebuilds.
 import subprocess
 subprocess.check_call(['/usr/local/go/bin/gofmt', '-w',

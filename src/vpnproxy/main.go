@@ -96,13 +96,14 @@ const (
 	// de virar vazio e encolher a janela (congelamento pos-speedtest).
 	// tambem escala com curDLCap() (ver curReplayRetain).
 	replayRetainMax = 256 << 20
-	replayRetainMin = 8 << 20          // janela do app e 8MB: retain menor gera vazio no re-pull
-	idleSessionTTL  = 15 * time.Minute // zumbi (app sumiu sem fechar limpo) e liberado logo; ajustavel via --idle
+	replayRetainMin = 8 << 20           // janela do app e 8MB: retain menor gera vazio no re-pull
+	idleSessionTTL  = 120 * time.Second // dtproto client_inactive_timeout: zumbi sem bytes reais ha 120s e liberado; ajustavel via --idle
 	connIdleTO      = 24 * time.Hour
 	connWriteTO     = 30 * time.Second // timeout de escrita no app (mobile CGNAT precisa de mais tempo)
 	chunkWait       = 500 * time.Millisecond
-	maxPendingUp    = 8192  // frames de upload fora de ordem (sanidade)
-	maxConnOutQ     = 32768 // slots na fila de resposta por conexao (app 5.0.0: 32 connections)
+	maxPendingUp    = 8192    // frames de upload fora de ordem (sanidade)
+	maxConnOutQ     = 32768   // slots na fila de resposta por conexao (app 5.0.0: 32 connections)
+	upQueueBytesMax = 8 << 20 // limite de bytes na fila de upload (dtproto NormalizedMaxUploadQueueBytes)
 )
 
 var (
@@ -156,24 +157,26 @@ func updateDynamicCaps(ram ramInfo, nSessions int) {
 	if nSessions < 1 {
 		nSessions = 1
 	}
-	// reserva 50% da RAM disponivel pro conjunto de buffers de download;
-	// o resto fica pra SO, goroutines, outros buffers do processo etc.
-	budget := int64(float64(ram.Available) * 0.8)
+	// ORCAMENTO GLOBAL: o conjunto de dlBuf nao pode passar de 60%
+	// da RAM disponivel. O piso antigo (12MB por sessao) derrotava
+	// esse limite quando havia milhares de sessoes — agora o cap
+	// por sessao realmente divide o orcamento (estilo dtproto).
+	budget := int64(float64(ram.Available) * 0.60)
 	per := budget / int64(nSessions)
 	if per > dlSoftCapMax {
 		per = dlSoftCapMax
 	}
-	if per < dlSoftCapMin {
-		per = dlSoftCapMin
+	if per < 1<<20 {
+		per = 1 << 20
 	}
-	// retem pelo menos a janela do app (8MB) para o re-pull nao
-	// devolver vazio e encolher a janela durante rajadas.
+	// Replay acompanha o cap por sessao. Com poucos usuarios continua
+	// bem acima da janela de 8MB do app; com muitos, encolhe junto.
 	retain := per * 2 / 3
 	if retain > replayRetainMax {
 		retain = replayRetainMax
 	}
-	if retain < replayRetainMin {
-		retain = replayRetainMin
+	if retain < 256<<10 {
+		retain = 256 << 10
 	}
 	dynCapMu.Lock()
 	changed := dynDLCap != per
@@ -435,8 +438,9 @@ type Session struct {
 	nextOff   int64 // cursor: offset do proximo byte a entregar
 	anchored  bool
 	// fila de upload desacoplada: reader nunca espera o upstream
-	upQ    chan upItem
-	upDone chan struct{} // fechado em kill/reset p/ encerrar o worker
+	upQ      chan upItem
+	upQBytes int64         // bytes pendentes na fila de upload (backpressure por bytes)
+	upDone   chan struct{} // fechado em kill/reset p/ encerrar o worker
 	// geracao do ciclo de conversa: sobe a cada reset (novo upload seq=0)
 	epoch       uint64
 	lastUpWrite time.Time // ultima escrita bem-sucedida ao upstream
@@ -478,6 +482,7 @@ func (s *Session) resetLocked() {
 	s.ssh = nil
 	s.dialing = false
 	s.nextSeq = 0
+	s.upQBytes = 0
 	s.pending = map[uint64][]byte{}
 	s.dlBuf = nil
 	s.dlBase = 0
@@ -693,6 +698,14 @@ func (s *Session) upWorker(conn net.Conn, gen uint64, done chan struct{}) {
 				log.Printf("sessao %x: erro escrevendo SSH (gen=%d): %v — readLoop reconecta", s.key, gen, err)
 				return // readLoop ja setou s.ssh=nil; ensureSSH reconecta
 			}
+			s.mu.Lock()
+			if s.upQBytes > int64(len(it.data)) {
+				s.upQBytes -= int64(len(it.data))
+			} else {
+				s.upQBytes = 0
+			}
+			s.cond.Broadcast()
+			s.mu.Unlock()
 		case <-done:
 			return
 		}
@@ -840,6 +853,19 @@ func (s *Session) pushUpload(seq uint64, data []byte, c net.Conn) bool {
 		// Bloqueante de proposito: byte SSH descartado = stream corrompido
 		// = desconecta (speed test!). Backpressure aqui segura o frame do
 		// app no socket (TCP) — o app retransmite se precisar.
+		// Backpressure por bytes: a fila nao pode crescer sem limite
+		// (dtproto tem NormalizedMaxUploadQueueBytes). O cond acorda
+		// quando o upWorker termina de escrever no SSH.
+		s.mu.Unlock()
+		s.mu.Lock()
+		for s.upQBytes+int64(len(d)) > upQueueBytesMax && !s.dead && s.epoch == ep {
+			s.cond.Wait()
+		}
+		if s.dead || s.epoch != ep {
+			s.mu.Unlock()
+			return false
+		}
+		s.upQBytes += int64(len(d))
 		s.mu.Unlock()
 		s.upQ <- upItem{gen: ep, data: d}
 		s.mu.Lock()
@@ -1997,6 +2023,10 @@ func handleConn(c net.Conn, dest string, fallback string) {
 	}
 }
 
+func budgetBytes(ram ramInfo) int64 {
+	return int64(float64(ram.Available) * 0.60)
+}
+
 //────────────────────────── reaper ─────────────────────────
 
 func reaper() {
@@ -2023,9 +2053,11 @@ func reaper() {
 			s       *Session
 			dlBytes int64
 			last    time.Time
+			lastAct time.Time
 		}
 		var stale, gapStuck, dlFrozen []*Session
 		var candidates []sinfo // candidatas a trim por excesso de dlBuf (ordinario + pressao de RAM)
+		var totalDL int64
 		for _, s := range registry.m {
 			s.mu.Lock()
 			// s.last e atualizado por QUALQUER frame, inclusive o polling
@@ -2064,7 +2096,8 @@ func reaper() {
 				dlFrozen = append(dlFrozen, s)
 			}
 			if !s.dead && len(s.served) > 0 && len(s.dlBuf) > 0 {
-				candidates = append(candidates, sinfo{s, int64(len(s.dlBuf)), s.last})
+				candidates = append(candidates, sinfo{s, int64(len(s.dlBuf)), s.last, lastAct})
+				totalDL += int64(len(s.dlBuf))
 			}
 			s.mu.Unlock()
 		}
@@ -2138,6 +2171,27 @@ func reaper() {
 		// Libera o cap antigo de dlBuf. Sem isso o "limpou 0KB" reduz
 		// len, mas o array de ~256MB alocado no speedtest fica preso
 		// pelo sufixo de 6MB e o RSS não volta.
+		// Teto global: se o somatorio dos buffers passou do orcamento,
+		// corta primeiro as sessoes sem atividade real (mesma logica do
+		// client_cleanup do dtproto), ate o total voltar para o limite.
+		if totalDL > budgetBytes(ram) {
+			sort.Slice(candidates, func(i, j int) bool {
+				return candidates[i].lastAct.Before(candidates[j].lastAct)
+			})
+			for _, ci := range candidates {
+				if totalDL <= budgetBytes(ram) {
+					break
+				}
+				ci.s.mu.Lock()
+				cut := ci.s.trimServedLocked()
+				ci.s.mu.Unlock()
+				if cut > 0 {
+					totalDL -= cut
+					ci.s.cond.Broadcast()
+				}
+			}
+		}
+
 		for _, ci := range candidates {
 			ci.s.mu.Lock()
 			ci.s.compactDLBufLocked(4 << 20)

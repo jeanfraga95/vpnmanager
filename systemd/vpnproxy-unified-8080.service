@@ -7,7 +7,7 @@ Wants=network-online.target ssh.service sshd-bhttp.service
 Type=simple
 User=root
 ExecStart=/etc/VPNManager/bin/vpnproxy-unified --port 8080 --silent-ws \
-  --static-target 127.0.0.1:22 --idle 24h \
+  --static-target 127.0.0.1:22 --idle 120s \
   --quic-port 8080 \
   --tls-cert /etc/VPNManager/conf/bhttp_80_cert.pem \
   --tls-key /etc/VPNManager/conf/bhttp_80_key.pem \
