@@ -298,28 +298,66 @@ _draw_status_box(){
     STATUS_BOX_LINES=$(( UI_ROW - start_row ))
 }
 
+# Converte uma linha logica do menu para a linha fisica atual do terminal,
+# descontando o scroll acumulado quando o conteudo e maior que o pane.
+_physical_row(){
+    local logical=$1 th scroll=0
+    th=$(tput lines 2>/dev/null || echo 24)
+    (( th < 1 )) && th=24
+    # UI_ROW e a linha logica atual (a do prompt) quando esta funcao e chamada.
+    (( UI_ROW > th )) && scroll=$(( UI_ROW - th ))
+    logical=$(( logical - scroll ))
+    (( logical < 1 )) && logical=1
+    (( logical > th )) && logical=$th
+    echo "$logical"
+}
+
+# Volta o cursor para o prompt "Opcao:" sem redesenhar o menu.
+_restore_prompt_cursor(){
+    local row col
+    row=$(_physical_row "$PROMPT_ROW")
+    col=$PROMPT_COL
+    (( col < 1 )) && col=1
+    printf "\033[%d;%dH\033[K" "$row" "$col"
+}
+
 # Atualiza somente a caixa de status, sem tocar no menu.
-# Movimento RELATIVO a partir do cursor (linha do prompt): posicoes absolutas
-# ficam erradas quando o terminal rola e duplicavam o cabecalho/IP.
-# Nunca roda enquanto há caracteres digitados.
+# Usa posicionamento ABSOLUTO: movimento relativo a partir do prompt caia
+# sobre as ultimas opcoes e duplicava a caixa no fim do menu.
+# Nunca roda enquanto ha caracteres digitados.
 _update_cpu_ram_only(){
     local tw; tw=$(_get_tw)
     if [[ -n "$MENU_TW" && "$tw" != "$MENU_TW" ]]; then
         draw_header_full
         _draw_menu_items
         _menu_prompt_pos
+        _restore_prompt_cursor
         return 0
     fi
 
     local saved_row=$UI_ROW
-    # Sobe ate o topo da caixa na posicao em que ela realmente esta na tela.
-    printf "\033[%dA\033[1G" "$STATUS_BOX_LINES"
+    local th; th=$(tput lines 2>/dev/null || echo 24)
+    (( th < 1 )) && th=24
+
+    local top_row
+    top_row=$(_physical_row "$STATUS_TOP_ROW")
+
+    # Se a caixa saiu da area visivel, redesenha tudo para nao corromper o menu.
+    if (( top_row < 1 )) || (( top_row + STATUS_BOX_LINES > th )); then
+        draw_header_full
+        _draw_menu_items
+        _menu_prompt_pos
+        _restore_prompt_cursor
+        return 0
+    fi
+
+    printf "\033[%d;1H\033[K" "$top_row"
+    UI_ROW=$STATUS_TOP_ROW
     # Atualiza também a contagem Xray (uma chamada leve à API local).
     S_XRAY_ONLINE=$(_xray_online_count)
     _draw_status_box "$(_get_cpu_usage)" "$(_get_mem_usage)"
     UI_ROW=$saved_row
-    # Como desenhamos exatamente STATUS_BOX_LINES linhas, o cursor volta
-    # sozinho para a linha do prompt; sem coordenadas absolutas.
+    _restore_prompt_cursor
 }
 
 # ── Draw header completo ──────────────────────────────────────
