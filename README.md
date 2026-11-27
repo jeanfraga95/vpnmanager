@@ -84,7 +84,7 @@ O proxy em produção é o binário **patched/híbrido**:
   `npv-x` (header HTTP ou payload legado) ou o banner `SSH-`. Isso mantém o
   timing do hsproxy sem perder filtro de decoys, DPI, keepalive e timeout 24h.
   `--auto-200` volta ao modo antigo (responde `200` imediatamente).
-- Produção 25/11/2026: WS 8080 substituído pelo `vpnproxy-unified-8080` (`101` → `200` imediato); XHTTP real em `11443` (loopback); fallback `19080` removido.
+- Produção 25/11/2026: WS 8080 substituído pelo `vpnproxy-unified-8080` (`101` → `200` imediato); XHTTP real em `8443` (público e backend); fallback `19080` removido.
 - **HCR na 80**: o sniff do BHTTP reconhece o cabeçalho HCR plain
   (`Operation 1-6` + `Version 0x01`, 62 bytes) e roteia internamente para
   `127.0.0.1:18082`. Validado: `HCR plain op=1` → `18082`.
@@ -112,15 +112,14 @@ O proxy em produção é o binário **patched/híbrido**:
 | 80/tcp + 80/udp | entrada pública unificada (`vpnproxy-unified`): BHTTP/HCR/WS/XHTTP/SSH |
 | 8080/tcp + 8080/udp | entrada pública unificada (`vpnproxy-unified-8080`): BHTTP/HCR/WS/XHTTP/SSH |
 | 19080 | removido; o fallback lógico do menu é `127.0.0.1:8080` (ver abaixo) |
-| 18082 / 11443 | backends loopback de HCR e XHTTP |
-| 443 | xray |
+| 18082 | backend loopback de HCR |
+| 8443 | XHTTP público (também backend dos proxies 80/8080) |
+| 443 | Xray VLESS xhttp/tls (certificado com o IP da VPS), fallback → 8080 |
 | 18082 | hcr-server (loopback) |
-| 11443 | xhttpssh (loopback via drop-in systemd) |
 | 2223 | sshd-bhttp (loopback) |
 | 22 | sshd |
 
-**Fechadas / não usadas:** `8443` (TCP e UDP), `8787`, `8788`, `9090`,
-`9443`, `18083`. O HCR não tem porta pública: chega pela 80 via BHTTP e o
+**Fechadas / não usadas:** `8787`, `8788`, `9090`, `9443`, `18083`. O HCR não tem porta pública: chega pela 80 via BHTTP e o
 dispatcher interno encaminha para `127.0.0.1:18082`. O comando
 `vpnmanager-stack` mostra o estado da stack; a stack publica atual deve ser
 reaplicada pelos serviços `vpnproxy-unified` / `vpnproxy-unified-8080` (o
@@ -209,7 +208,7 @@ minutos, com apenas 10 slots. O guard foi estendido para os DOIS listeners:
 - Validação 24/11/2026: HCR via 80 respondeu cabeçalho de status e o log do
   fallback registrou `HCR plain op=1` → `127.0.0.1:18082`; HTTP/XHTTP e
   WebSocket pela 80 retornaram banner SSH; `101 → 200 → SSH` confirmado na
-  8080 (local e CDN); portas `8443/8787/8788/9090/9443/18082/11443` fechadas
+  8080 (local e CDN); XHTTP em `8443`; portas `8787/8788/9090/9443/18082` fechadas
   externamente.
 
 Detalhes do proxy: [`src/proxycloudjf/README.md`](src/proxycloudjf/README.md).
@@ -251,7 +250,7 @@ porta pública e roteia sem redial externo:
 
 - **BHTTP** TCP/TLS/QUIC → motor `bhttpssh` inalterado → `127.0.0.1:2223`.
 - **HCR plain** → `127.0.0.1:18082` (módulo loopback interno).
-- **XHTTP** (`x-http-sid` / `x-session-id`) → `127.0.0.1:11443` (módulo loopback).
+- **XHTTP** (`x-http-sid` / `x-session-id`) → `8443` (público e backend dos proxies).
 - **WebSocket CloudJF, CONNECT, SOCKS4/5, TLS/SNI e decoys** → dentro do próprio
   processo (`src/vpnproxy/internal/wsproxy/`), com `101` em 50ms e `--auto-200`.
 - **Zero bytes iniciais** continua indo para BHTTP; SSH direto permanece atrás de
@@ -268,13 +267,13 @@ Rollback: `/root/rollback_unified.sh`. Backup completo:
 A unit `vpnproxy-unified-8080.service` foi habilitada em 25/11/2026; as units
 `vpnproxy-ws-8080`, `vpnproxy-bhttp-80` e `vpnproxy-fallback` estão inativas e
 desabilitadas. O `healthcheck.sh` agora monitora apenas `vpnproxy-unified`,
-`vpnproxy-unified-8080`, `vpnproxy-xhttp-11443`, `hcr-server`, `sshd-bhttp` e
+`vpnproxy-unified-8080`, `vpnproxy-xhttp-8443`, `hcr-server`, `sshd-bhttp` e
 `checkuser`, evitando restart-loop e conflito de bind.
 
 Validação: `101 → 200 → banner SSH`, CONNECT e SOCKS5 idênticos ao baseline da
 80 e 8080; XHTTP e HCR roteados corretamente; TLS 1.3 com ALPN `bhttp-ssh`; ~98
 conexões reais na 80 com `WRITE->SSHD` no log; RSS ~55MB, 138 FDs, 6 threads;
-portas `8443/8787/8788/9090/9443/18082/11443` fechadas externamente.
+portas `8787/8788/9090/9443/18082` fechadas externamente; `8443` é o XHTTP.
 
 ### `--silent-ws` na 8080 (25/11/2026)
 

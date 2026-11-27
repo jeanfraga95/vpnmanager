@@ -79,6 +79,7 @@ MENU_TW=""
 PROMPT_ROW=1
 PROMPT_COL=8
 STATUS_TOP_ROW=8
+STATUS_BOX_LINES=5
 S_IP=""
 S_USERS=0
 S_ONLINE=0            # usuários SSH online
@@ -270,6 +271,7 @@ _draw_status_box(){
     local cpu=$1 mem=$2
     local tw; tw=$(_get_tw)
     local total_online=$((S_ONLINE + S_XRAY_ONLINE))
+    local start_row=$UI_ROW
 
     _box_top
     if (( tw >= 65 )); then
@@ -293,10 +295,13 @@ _draw_status_box(){
         _box_line " ${C_WHITE}C:${C_NC} $(_status_icon "$S_S4")  ${C_WHITE}S:${C_NC} $(_status_icon "$S_S5")"
     fi
     _box_top
+    STATUS_BOX_LINES=$(( UI_ROW - start_row ))
 }
 
 # Atualiza somente a caixa de status, sem tocar no menu.
-# Usa posicionamento absoluto e nunca roda enquanto há caracteres digitados.
+# Movimento RELATIVO a partir do cursor (linha do prompt): posicoes absolutas
+# ficam erradas quando o terminal rola e duplicavam o cabecalho/IP.
+# Nunca roda enquanto há caracteres digitados.
 _update_cpu_ram_only(){
     local tw; tw=$(_get_tw)
     if [[ -n "$MENU_TW" && "$tw" != "$MENU_TW" ]]; then
@@ -307,12 +312,14 @@ _update_cpu_ram_only(){
     fi
 
     local saved_row=$UI_ROW
-    printf "\033[%d;1H" "$STATUS_TOP_ROW"
+    # Sobe ate o topo da caixa na posicao em que ela realmente esta na tela.
+    printf "\033[%dA\033[1G" "$STATUS_BOX_LINES"
     # Atualiza também a contagem Xray (uma chamada leve à API local).
     S_XRAY_ONLINE=$(_xray_online_count)
     _draw_status_box "$(_get_cpu_usage)" "$(_get_mem_usage)"
     UI_ROW=$saved_row
-    printf "\033[%d;%dH" "$PROMPT_ROW" "$PROMPT_COL"
+    # Como desenhamos exatamente STATUS_BOX_LINES linhas, o cursor volta
+    # sozinho para a linha do prompt; sem coordenadas absolutas.
 }
 
 # ── Draw header completo ──────────────────────────────────────
@@ -488,7 +495,7 @@ full_uninstall(){
     echo
     msg "Parando e removendo servicos do VPNManager..."
     local u f sn left=()
-    for u in sshd-bhttp hcr-server vpnproxy-xhttp-11443 vpnproxy-fallback \
+    for u in sshd-bhttp hcr-server vpnproxy-xhttp-8443 vpnproxy-fallback \
              vpnproxy-ws-8080 vpnproxy-bhttp-80 checkuser; do
         systemctl disable --now "$u" >/dev/null 2>&1 || true
         rm -f "/etc/systemd/system/${u}.service"

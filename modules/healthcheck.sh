@@ -6,7 +6,7 @@ INSTALL_DIR="/etc/VPNManager"
 LOG="/var/log/vpnmanager_healthcheck.log"
 
 # Lista de servicos criticos (podem nao existir em todas instalacoes)
-CRITICAL_SVCS="vpnproxy-unified vpnproxy-unified-8080 vpnproxy-xhttp-11443 hcr-server sshd-bhttp checkuser"
+CRITICAL_SVCS="vpnproxy-unified vpnproxy-unified-8080 vpnproxy-xhttp-8443 hcr-server sshd-bhttp checkuser"
 
 # Garante que conexoes SSH pre-auth nao esgotem os slots (4 proxies usam a 22).
 if [[ -x "$INSTALL_DIR/modules/sshd_auth_guard.sh" ]]; then

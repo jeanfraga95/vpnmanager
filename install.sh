@@ -426,7 +426,7 @@ SVC
 # ── Passo 12: backends internos (BHTTP + WebSocket + HCR + XHTTP) ──
 # O listener publico nao e mais criado pelo stack legado: ele sempre usa
 # o binario unificado (vpnproxy-unified), habilitado no passo seguinte.
-# Aqui criamos somente sshd-bhttp(2223), HCR(18082) e XHTTP(11443).
+# Aqui criamos somente sshd-bhttp(2223), HCR(18082) e XHTTP(8443).
 step_port80_stack(){
     if [[ -f "$INSTALL_DIR/modules/port80_stack.sh" ]]; then
         VPNMANAGER_SKIP_PUBLIC=1 bash "$INSTALL_DIR/modules/port80_stack.sh" >/dev/null 2>&1 || true
@@ -523,12 +523,13 @@ echo -e "  ${C}Porta ${PRIMARY_PORT}:${NC} BHTTP + WebSocket + HCR + XHTTP (prox
 echo -e "  ${C}Porta 8080:${NC}    proxy unificado (mesmos protocolos da 80)"
 if systemctl is-active --quiet xray 2>/dev/null && \
    grep -q '^XRAY_PORT=443' "$INSTALL_DIR/conf/vpnmanager.conf" 2>/dev/null; then
-    echo -e "  ${C}Porta 443:${NC}     Xray VLESS (xhttp/tls) configurado"
+    echo -e "  ${C}Porta 443:${NC}     Xray VLESS (xhttp/tls, cert IP) fallback -> 8080"
 else
     echo -e "  ${Y}Porta 443:${NC}     liberada no firewall (dono existente preservado)"
 fi
 [[ "$PRIMARY_PORT" == 8080 ]] && \
     echo -e "  ${Y}Porta 80:${NC}     reservada para outro sistema (nao foi alterada)"
-echo -e "  ${C}Interno:${NC}  sshd-bhttp 2223, HCR 18082, XHTTP 11443"
+echo -e "  ${C}Porta 8443:${NC}   XHTTP publico (backend dos proxies 80/8080)"
+echo -e "  ${C}Interno:${NC}  sshd-bhttp 2223, HCR 18082"
 echo
 echo -e "  Execute: ${G}menuvpn${NC}"

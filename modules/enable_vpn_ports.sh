@@ -9,7 +9,8 @@
 #             somente se a porta estiver livre ou ja for nossa. Se outro
 #             sistema (ex.: proto-server/dtproto) a ocupa, nada e tocado.
 #   * 8080 -> vpnproxy-unified-8080 (mesmos protocolos da 80), sempre.
-#   * 443  -> Xray VLESS (xhttp/tls, fallback SSH -> 22) somente se a
+#   * 8443 -> XHTTP publico (e backend dos proxies 80/8080).
+#   * 443  -> Xray VLESS (xhttp/tls, fallback -> 8080) somente se a
 #             porta estiver livre ou ja for Xray. Se stunnel/outro servico
 #             a ocupa, apenas liberamos o firewall e preservamos o dono.
 #
@@ -141,7 +142,9 @@ _ensure_xray_443(){
     fi
 
     uuid=$(gen_uuid)
-    if ! write_xray_config "$port" "tls" "$uuid" "22" "xhttp" >/dev/null 2>&1; then
+    # Fallback do Xray aponta para o proxy unificado na 8080: nesta porta
+    # tambem funcionam as demais conexoes via proxy (WS/BHTTP/HCR/XHTTP).
+    if ! write_xray_config "$port" "tls" "$uuid" "8080" "xhttp" >/dev/null 2>&1; then
         warn "Nao foi possivel escrever o config do Xray (firewall liberado)."
         return 0
     fi
@@ -152,18 +155,18 @@ _ensure_xray_443(){
         conf_set "XRAY_MODE"      "tls"
         conf_set "XRAY_TRANSPORT" "xhttp"
         xray_save_credentials "$port" "tls" "$host" "$uuid" "xhttp" >/dev/null 2>&1 || true
-        ok "Xray VLESS (xhttp/tls) ativo na porta ${port}, fallback SSH -> 22."
+        ok "Xray VLESS (xhttp/tls) ativo na porta ${port}, fallback -> 8080 (proxy)."
     else
         warn "Xray nao iniciou na porta ${port}; firewall liberado e servicos preservados."
     fi
 }
 
 main(){
-    msg "Habilitando portas publicas do VPNManager (80, 8080, 443)..."
+    msg "Habilitando portas publicas do VPNManager (80, 8080, 8443, 443)..."
     local p
-    for p in 80 8080 443; do _fw_allow "$p"; done
+    for p in 80 8080 8443 443; do _fw_allow "$p"; done
 
-    # Backends internos (sshd-bhttp 2223, HCR 18082, XHTTP 11443).
+    # Backends internos (sshd-bhttp 2223, HCR 18082, XHTTP 8443).
     if [[ -f "$MODULES/port80_stack.sh" ]]; then
         VPNMANAGER_SKIP_PUBLIC=1 bash "$MODULES/port80_stack.sh" >/dev/null 2>&1 || true
     fi
@@ -180,7 +183,7 @@ main(){
 
     echo
     msg "Resumo das portas publicas:"
-    for p in 80 8080 443; do
+    for p in 80 8080 8443 443; do
         local own; own=$(_port_owner "$p")
         printf '  %-5s -> %s\n' "$p" "${own:-livre}"
     done

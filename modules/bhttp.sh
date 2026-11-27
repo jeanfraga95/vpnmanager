@@ -182,8 +182,8 @@ _bhttp_ensure_fallback(){
             cat > "/etc/systemd/system/${sn}.service" << SVC
 [Unit]
 Description=VPNManager fallback interno 19080 (HCR + WebSocket + XHTTP)
-After=network.target hcr-server.service vpnproxy-xhttp-11443.service
-Wants=hcr-server.service vpnproxy-xhttp-11443.service
+After=network.target hcr-server.service vpnproxy-xhttp-8443.service
+Wants=hcr-server.service vpnproxy-xhttp-8443.service
 
 [Service]
 Type=simple
@@ -210,7 +210,7 @@ SVC
 # Backends internos precisam estar vivos; nunca reinicia os que ja estao.
 _bhttp_ensure_internals(){
     local svc
-    for svc in sshd-bhttp hcr-server vpnproxy-xhttp-11443; do
+    for svc in sshd-bhttp hcr-server vpnproxy-xhttp-8443; do
         if ! systemctl is-active --quiet "$svc" 2>/dev/null; then
             systemctl start "$svc" >/dev/null 2>&1 || true
         fi
@@ -253,13 +253,13 @@ _bhttp_write_unified_service(){
     exec_cmd="${exec_cmd} --idle 24h --quic-port ${porta}"
     exec_cmd="${exec_cmd} --tls-cert ${BHTTP_CERT} --tls-key ${BHTTP_KEY}"
     exec_cmd="${exec_cmd} --hcr-target 127.0.0.1:18082"
-    exec_cmd="${exec_cmd} --xhttp-target 127.0.0.1:11443"
+    exec_cmd="${exec_cmd} --xhttp-target 127.0.0.1:8443"
     exec_cmd="${exec_cmd} --ws-to 127.0.0.1:22"
 
     cat > "/etc/systemd/system/${sn}.service" << SVC
 [Unit]
 Description=VPNManager unified proxy ${porta} (BHTTP/HCR/WS/XHTTP/SSH) -> ${destino}
-After=network-online.target ssh.service sshd-bhttp.service hcr-server.service vpnproxy-xhttp-11443.service
+After=network-online.target ssh.service sshd-bhttp.service hcr-server.service vpnproxy-xhttp-8443.service
 Wants=network-online.target ssh.service sshd-bhttp.service
 
 [Service]

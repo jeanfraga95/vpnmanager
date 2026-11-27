@@ -1,6 +1,6 @@
 [Unit]
 Description=VPNManager unified proxy 80 (BHTTP/QUIC/TLS + HCR + WS + XHTTP + SSH + CONNECT/SOCKS)
-After=network-online.target ssh.service sshd-bhttp.service hcr-server.service vpnproxy-xhttp-11443.service
+After=network-online.target ssh.service sshd-bhttp.service hcr-server.service vpnproxy-xhttp-8443.service
 Wants=network-online.target ssh.service sshd-bhttp.service
 
 [Service]
@@ -12,7 +12,7 @@ ExecStart=/etc/VPNManager/bin/vpnproxy-unified --port 80 --silent-ws \
   --tls-cert /etc/VPNManager/conf/bhttp_80_cert.pem \
   --tls-key /etc/VPNManager/conf/bhttp_80_key.pem \
   --hcr-target 127.0.0.1:18082 \
-  --xhttp-target 127.0.0.1:11443 \
+  --xhttp-target 127.0.0.1:8443 \
   --ws-to 127.0.0.1:22
 Restart=always
 RestartSec=3

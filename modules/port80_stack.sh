@@ -3,8 +3,8 @@
 # port80_stack.sh - Stack unica da porta 80
 #
 # BHTTP (TCP/UDP 80) -> fallback interno 19080 -> WebSocket, XHTTP e HCR.
-# Sem nginx e sem portas publicas avulsas (8443/8787/8788/9090/9443).
-# HCR e XHTTP ficam em loopback; so a 80 (e a 8080 legada) sao publicas.
+# Sem nginx e sem portas publicas avulsas (8787/8788/9090/9443).
+# HCR fica em loopback; XHTTP usa 8443 (publico e backend dos proxies).
 #
 # Uso: bash /etc/VPNManager/modules/port80_stack.sh
 # VPNMANAGER_SKIP_PUBLIC=1 cria somente os backends internos (sshd-bhttp,
@@ -24,7 +24,7 @@ FALLBACK_BIN="$INSTALL_DIR/bin/fallback-proxy/fallback-proxy"
 HCR_BIN="$INSTALL_DIR/bin/hcr-server"
 
 mkdir -p "$INSTALL_DIR/conf" "$INSTALL_DIR/bin" \
-         /etc/systemd/system/vpnproxy-xhttp-11443.service.d
+         /etc/systemd/system/vpnproxy-xhttp-8443.service.d
 
 # ── Certificados ────────────────────────────────────────────
 if [[ ! -f "$INSTALL_DIR/conf/hcr_80_cert.pem" || ! -f "$INSTALL_DIR/conf/hcr_80_key.pem" ]]; then
@@ -116,15 +116,23 @@ WantedBy=multi-user.target
 EOF
 fi
 
-# ── XHTTP: 11443 restrito a loopback ────────────────────────
-cat > /etc/systemd/system/vpnproxy-xhttp-11443.service << EOF
+# ── XHTTP: 8443 (publico e tambem backend dos proxies 80/8080) ─
+# Remove a unit antiga em 11443 e qualquer drop-in que restringisse
+# o XHTTP a loopback (versoes anteriores usavam 11443 somente interno).
+systemctl stop vpnproxy-xhttp-11443 >/dev/null 2>&1 || true
+systemctl disable vpnproxy-xhttp-11443 >/dev/null 2>&1 || true
+rm -f /etc/systemd/system/vpnproxy-xhttp-11443.service
+rm -rf /etc/systemd/system/vpnproxy-xhttp-11443.service.d
+rm -f /etc/systemd/system/vpnproxy-xhttp-8443.service.d/override.conf
+
+cat > /etc/systemd/system/vpnproxy-xhttp-8443.service << EOF
 [Unit]
-Description=VPNManager XHTTP interno 11443 -> 22 (loopback)
+Description=VPNManager XHTTP 8443 -> 22
 After=network.target ssh.service
 
 [Service]
 Type=simple
-ExecStart=$XHTTP_BIN --port 11443 --to 22
+ExecStart=$XHTTP_BIN --port 8443 --to 22
 Restart=always
 RestartSec=3
 LimitNOFILE=1000000
@@ -133,20 +141,13 @@ LimitNOFILE=1000000
 WantedBy=multi-user.target
 EOF
 
-cat > /etc/systemd/system/vpnproxy-xhttp-11443.service.d/override.conf <<'CONF'
-[Service]
-IPAddressAllow=127.0.0.1/32
-IPAddressAllow=::1/128
-IPAddressDeny=any
-CONF
-
 # ── Fallback: 19080 interno -> HCR/WS/XHTTP ─────────────────
 if [[ "$SKIP_PUBLIC" != "1" ]]; then
 cat > /etc/systemd/system/vpnproxy-fallback.service <<'SVC'
 [Unit]
 Description=VPNManager fallback interno 19080 (HCR + WebSocket + XHTTP)
-After=network.target hcr-server.service vpnproxy-ws-8080.service vpnproxy-xhttp-11443.service
-Wants=hcr-server.service vpnproxy-ws-8080.service vpnproxy-xhttp-11443.service
+After=network.target hcr-server.service vpnproxy-ws-8080.service vpnproxy-xhttp-8443.service
+Wants=hcr-server.service vpnproxy-ws-8080.service vpnproxy-xhttp-8443.service
 
 [Service]
 Type=simple
@@ -189,7 +190,7 @@ done
 
 # ── Aplica stack ────────────────────────────────────────────
 systemctl daemon-reload
-CORE_SVCS="sshd-bhttp hcr-server vpnproxy-xhttp-11443"
+CORE_SVCS="sshd-bhttp hcr-server vpnproxy-xhttp-8443"
 [[ "$SKIP_PUBLIC" != "1" ]] && \
     CORE_SVCS="$CORE_SVCS vpnproxy-ws-8080 vpnproxy-fallback vpnproxy-bhttp-80"
 systemctl enable $CORE_SVCS >/dev/null 2>&1 || true
@@ -201,7 +202,7 @@ done
 cat > /usr/local/bin/vpnmanager-stack <<'CMD'
 #!/bin/bash
 echo "Stack VPNManager (sem nginx):"
-for s in vpnproxy-unified vpnproxy-unified-8080 vpnproxy-bhttp-80 vpnproxy-fallback vpnproxy-ws-8080 vpnproxy-xhttp-11443 hcr-server sshd-bhttp; do
+for s in vpnproxy-unified vpnproxy-unified-8080 vpnproxy-bhttp-80 vpnproxy-fallback vpnproxy-ws-8080 vpnproxy-xhttp-8443 hcr-server sshd-bhttp; do
     [[ -f "/etc/systemd/system/$s.service" ]] || continue
     printf '  %-28s %s\n' "$s" "$(systemctl is-active "$s" 2>/dev/null || echo missing)"
 done
@@ -217,7 +218,7 @@ preauthb=$(ps -eo pid,ppid,etimes,args | awk -v m="$mainb" '$2==m && /\[accepted
 printf '  %-28s %s (%s pre-auth)\n' "sshd 2223" "$startupsb/300" "$preauthb"
 echo
 echo "Portas publicas (ver ss -lntp): 80 e/ou 8080/tcp BHTTP+WS+XHTTP+HCR"
-echo "Portas internas: 2223 (sshd-bhttp), 18082 (HCR), 11443 (XHTTP)"
+echo "Portas internas: 2223 (sshd-bhttp), 18082 (HCR) | XHTTP: 8443"
 CMD
 chmod +x /usr/local/bin/vpnmanager-stack
 
