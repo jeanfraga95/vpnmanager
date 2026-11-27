@@ -45,7 +45,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Toda a saída do comando vai para $LOG_FILE; em caso de erro,
 # mostra o final do log e aborta.
 
-TOTAL_STEPS=14
+TOTAL_STEPS=15
 CUR_STEP=0
 
 # Arquivos que precisam existir junto do instalador. Sempre que o script
@@ -54,10 +54,13 @@ CUR_STEP=0
 REQUIRED_MODULES=(
     common.sh ssh_users.sh xray.sh v2ray.sh online_users.sh slowdns.sh
     badvpn.sh telegram_bot.sh system_info.sh proxy.sh bhttp.sh
-    port80_stack.sh limiter.sh banner.sh outras_opcoes.sh linguagem.sh
+    port80_stack.sh enable_vpn_ports.sh limiter.sh banner.sh outras_opcoes.sh linguagem.sh
     swap.sh healthcheck.sh sshd_auth_guard.sh theme.sh ram_clean.sh
     vpnmanager-healthcheck.service vpnmanager-healthcheck.timer
 )
+
+# Units publicas do proxy unificado (copiadas para /etc/systemd/system).
+UNIFIED_UNITS=(vpnproxy-unified.service vpnproxy-unified-8080.service)
 
 draw_progress(){
     local pct=$(( CUR_STEP * 100 / TOTAL_STEPS ))
@@ -96,6 +99,10 @@ step_validate_source(){
         aarch64|arm64) arch="aarch64" ;;
     esac
     [[ -d "$SCRIPT_DIR/bin/$arch" ]] || missing+=("bin/$arch")
+    [[ -f "$SCRIPT_DIR/bin/$arch/vpnproxy-unified" ]] || missing+=("bin/$arch/vpnproxy-unified")
+    for u in "${UNIFIED_UNITS[@]}"; do
+        [[ -f "$SCRIPT_DIR/systemd/$u" ]] || missing+=("systemd/$u")
+    done
 
     if (( ${#missing[@]} )); then
         echo
@@ -130,6 +137,12 @@ step_copy_modules(){
     chmod +x "$INSTALL_DIR/menu.sh"
     chmod +x "$INSTALL_DIR/modules/"*.sh
     ln -sf "$INSTALL_DIR/menu.sh" "$BIN_LINK"
+
+    # Units do proxy unificado: o passo de portas habilita e inicia as duas.
+    local u
+    for u in "${UNIFIED_UNITS[@]}"; do
+        cp "$SCRIPT_DIR/systemd/$u" "/etc/systemd/system/$u"
+    done
 }
 
 # ── Passo 3: dependências dos proxies (WebSocket/TLS-SSL) ──
@@ -410,45 +423,38 @@ SVC
     systemctl start vpnmanager-healthcheck.timer >/dev/null 2>&1 || true
 }
 
-# ── Passo 12: stack porta 80 (BHTTP + WebSocket + HCR + XHTTP) ──
+# ── Passo 12: backends internos (BHTTP + WebSocket + HCR + XHTTP) ──
+# O listener publico nao e mais criado pelo stack legado: ele sempre usa
+# o binario unificado (vpnproxy-unified), habilitado no passo seguinte.
+# Aqui criamos somente sshd-bhttp(2223), HCR(18082) e XHTTP(11443).
 step_port80_stack(){
-    local listener80
-    listener80=$(ss -lntp 2>/dev/null | awk '$4 ~ /:80$/ {print; exit}')
-
-    # Nunca mexemos em servico de outro sistema na 80 (ex.: proto-server/
-    # dtproto). O stack legado tentaria abrir a 80 e entrar em conflito.
-    if [[ -n "$listener80" ]] && ! grep -Eq 'vpnproxy|bhttpssh|hcr-server' <<<"$listener80"; then
-        echo "Porta 80 reservada por outro servico; VPNManager nao a altera."
-        echo "Usando 8080 como porta BHTTP principal."
-        for sn in vpnproxy-bhttp-80 vpnproxy-ws-8080 vpnproxy-hcr-tcp \
-                  vpnproxy-hcr-quic vpnproxy-port80 hcr-dispatcher nginx; do
-            systemctl stop "$sn" >/dev/null 2>&1 || true
-            systemctl disable "$sn" >/dev/null 2>&1 || true
-        done
-        # Cria somente backends internos (sshd-bhttp, HCR, XHTTP).
-        VPNMANAGER_SKIP_PUBLIC=1 bash "$INSTALL_DIR/modules/port80_stack.sh" >/dev/null 2>&1 || true
-        INSTALL_DIR="$INSTALL_DIR" bash -c '
-            source "$1/modules/common.sh"
-            source "$1/modules/linguagem.sh"
-            source "$1/modules/bhttp.sh"
-            _bhttp_ensure_primary_port
-        ' _ "$INSTALL_DIR"
-        return 0
-    fi
-
     if [[ -f "$INSTALL_DIR/modules/port80_stack.sh" ]]; then
-        bash "$INSTALL_DIR/modules/port80_stack.sh" >/dev/null 2>&1 || true
+        VPNMANAGER_SKIP_PUBLIC=1 bash "$INSTALL_DIR/modules/port80_stack.sh" >/dev/null 2>&1 || true
     fi
-    # Nenhuma porta avulsa: HCR e XHTTP ficam em loopback e o HCR
-    # chega pela 80 via fallback interno. nginx tambem nao e usado.
-    for sn in vpnproxy-hcr-tcp vpnproxy-hcr-quic vpnproxy-bhttp-18083 vpnproxy-port80 hcr-dispatcher nginx; do
+    # Remove apenas servicos avulsos antigos do proprios VPNManager.
+    for sn in vpnproxy-bhttp-80 vpnproxy-ws-8080 vpnproxy-hcr-tcp \
+              vpnproxy-hcr-quic vpnproxy-bhttp-18083 vpnproxy-port80 \
+              hcr-dispatcher nginx; do
         systemctl stop "$sn" >/dev/null 2>&1 || true
         systemctl disable "$sn" >/dev/null 2>&1 || true
     done
     return 0
 }
 
-# ── Passo 13: verificacao final da instalacao ───────────────
+# ── Passo 13: portas publicas + proxy unificado + Xray ────────
+# Idempotente: habilita 80 (BHTTP/proxy/HCR/XHTTP), 8080 (proxy) e
+# 443 (Xray) somente quando ainda nao estao habilitadas. Nunca mexe
+# em servico de terceiros que ja ocupe essas portas.
+step_vpn_ports(){
+    [[ -f "$INSTALL_DIR/modules/enable_vpn_ports.sh" ]] || {
+        echo "ERRO: modulo enable_vpn_ports.sh ausente."
+        return 1
+    }
+    timeout 15 systemctl daemon-reload >/dev/null 2>&1 || true
+    bash "$INSTALL_DIR/modules/enable_vpn_ports.sh"
+}
+
+# ── Passo 14: verificacao final da instalacao ───────────────
 step_verify_install(){
     local f
     [[ -x "$INSTALL_DIR/menu.sh" ]] || {
@@ -467,6 +473,12 @@ step_verify_install(){
     [[ -x "$INSTALL_DIR/bin/vpnproxy-unified" ]] || {
         echo "ERRO: $INSTALL_DIR/bin/vpnproxy-unified ausente."; return 1;
     }
+    local u
+    for u in "${UNIFIED_UNITS[@]}"; do
+        [[ -f "/etc/systemd/system/$u" ]] || {
+            echo "ERRO: unit /etc/systemd/system/$u ausente."; return 1;
+        }
+    done
 }
 
 # ── Execução ─────────────────────────────────────────────────
@@ -485,7 +497,8 @@ run_step "Gerando chaves de host SSH"          step_ssh_hostkeys
 run_step "Ajustando sshd_config"               step_ssh_config
 run_step "Reiniciando serviço SSH"             step_ssh_restart
 run_step "Finalizando"                         step_finish
-run_step "Configurando stack port 80 (WebSocket/BHTTP/HCR)" step_port80_stack
+run_step "Configurando backends internos (BHTTP/HCR/XHTTP)" step_port80_stack
+run_step "Habilitando portas 80/8080/443 (proxy e Xray)" step_vpn_ports
 run_step "Verificando instalacao"              step_verify_install
 echo
 echo
@@ -506,9 +519,16 @@ if [[ "$SSH_RESTART_OK" -eq 0 ]]; then
 fi
 PRIMARY_PORT=8080
 systemctl is-active --quiet vpnproxy-unified 2>/dev/null && PRIMARY_PORT=80
-echo -e "  ${C}Porta ${PRIMARY_PORT}:${NC} BHTTP + WebSocket + HCR + XHTTP"
+echo -e "  ${C}Porta ${PRIMARY_PORT}:${NC} BHTTP + WebSocket + HCR + XHTTP (proxy unificado)"
+echo -e "  ${C}Porta 8080:${NC}    proxy unificado (mesmos protocolos da 80)"
+if systemctl is-active --quiet xray 2>/dev/null && \
+   grep -q '^XRAY_PORT=443' "$INSTALL_DIR/conf/vpnmanager.conf" 2>/dev/null; then
+    echo -e "  ${C}Porta 443:${NC}     Xray VLESS (xhttp/tls) configurado"
+else
+    echo -e "  ${Y}Porta 443:${NC}     liberada no firewall (dono existente preservado)"
+fi
 [[ "$PRIMARY_PORT" == 8080 ]] && \
-    echo -e "  ${Y}Porta 80:${NC}   reservada para outro sistema (nao foi alterada)"
+    echo -e "  ${Y}Porta 80:${NC}     reservada para outro sistema (nao foi alterada)"
 echo -e "  ${C}Interno:${NC}  sshd-bhttp 2223, HCR 18082, XHTTP 11443"
 echo
 echo -e "  Execute: ${G}menuvpn${NC}"

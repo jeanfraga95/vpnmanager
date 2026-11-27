@@ -520,6 +520,7 @@ full_uninstall(){
     rm -f "$BIN_LINK"
     rm -f /etc/ssh/sshd_config_bhttp
     rm -f /usr/local/bin/hcr-server /usr/local/bin/hcr-dispatcher /usr/local/bin/checkuser
+    rm -f /usr/local/bin/vpnmanager-stack
     rm -rf /opt/magnumproxy
     rm -f /etc/bannerssh 2>/dev/null
     _banner_set_sshd_directive "none" 2>/dev/null || true
