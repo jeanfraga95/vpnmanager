@@ -45,11 +45,21 @@ conf_set(){
     flock -u 9
 }
 
-# Processo que escuta numa portaTCP publica (nome curto, sem pid/fd).
+# Processo que escuta numa porta TCP publica.
+# O campo users:(("nome",pid=...)) do ss trunca o nome em 15 caracteres
+# ("vpnproxy-unifie"), entao resolvemos o nome real via /proc/<pid>/exe.
 _port_owner(){
-    local port="$1" line
+    local port="$1" line pid exe
     line=$(ss -lntp 2>/dev/null | awk -v p=":${port}\$" '$4 ~ p {print $NF; exit}')
     [[ -z "$line" ]] && return 0
+    pid=$(printf '%s' "$line" | grep -oP 'pid=\K[0-9]+' | head -1)
+    if [[ -n "$pid" && -r "/proc/$pid/exe" ]]; then
+        exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+        if [[ -n "$exe" ]]; then
+            basename "$exe"
+            return 0
+        fi
+    fi
     printf '%s' "$line" | sed -nE 's/.*\("([^"]+)".*/\1/p'
 }
 
